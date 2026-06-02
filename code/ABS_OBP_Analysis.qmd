@@ -1,0 +1,1391 @@
+---
+title: "Triple-A ABS vs. Challenge: Batter Outcome Analysis"
+subtitle: "By Sam Reategui, Drexler Tanner, and John Meinersmann"
+date: today
+format:
+  pdf:
+    documentclass: article
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    fig-pos: "H"
+    fig-width: 7
+    fig-height: 4.5
+    geometry:
+      - margin=1in
+    include-in-header:
+      text: |
+        \usepackage{booktabs}
+        \usepackage{float}
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)   # data manipulation (dplyr, tidyr) and plotting (ggplot2)
+library(lubridate)   # date helpers: month(), wday(), floor_date()
+library(gridExtra)   # tableGrob for rendering data frames as plot objects
+library(ggridges)    # geom_density_ridges for stacked density plots
+library(cowplot)     # plot_grid for combining multiple ggplot objects
+library(magick)      # read and rasterize the batter background image
+
+# Dropbox direct-download URLs (dl=1 forces raw file download)
+URL_STATCAST  <- "https://www.dropbox.com/scl/fi/92m8m31o4a9f5ydbytysz/statcast_aaa_2023_2024_2025_combined.csv?rlkey=js056k9ykf21tozekqssd8raq&st=n5zvq48i&dl=1"
+URL_VENUE     <- "https://www.dropbox.com/scl/fi/tvds2vo8v2p9tpun5tldm/aaa_venue_games.csv?rlkey=wuvfg9vocv1lfb9vkppgml7x5&st=1jd65f0f&dl=1"
+URL_PLAYERS   <- "https://www.dropbox.com/scl/fi/me1qg6bas0yiltuv6x1ud/players_dim_2023_2025.csv?rlkey=2c921twezsl5g6s6zslk9h330&st=8a1e9lft&dl=1"
+URL_BATTER_IMG <- "https://www.dropbox.com/scl/fi/8txdfmc1c2i8xf5hm7mxn/batter.png?rlkey=2ignsk6e5tn2unxwq9ut7xspj&st=1le8xgf4&dl=1"
+```
+
+# Introduction
+
+Major League Baseball's Automated Ball-Strike (ABS) system represents the most significant change to umpiring in the sport's modern era. Rather than relying solely on human judgment, ABS uses a Hawk-Eye tracking system to call balls and strikes based on the three-dimensional position of the pitch relative to the rule-book strike zone. Triple-A (AAA) baseball served as the testing ground for this technology, piloting two distinct implementations across the 2023 and 2024 seasons:
+
+- **Full ABS** — Every ball-strike call is made by the automated system, removing the home-plate umpire's discretion entirely. Played on Mondays through Thursdays.
+- **ABS Challenge System** — The human umpire calls the pitch as normal, but each team has a limited number of challenges per game they can use to dispute a call and appeal to the Hawk-Eye system. Played on Fridays through Sundays.
+
+This structured alternation by day of week created a natural quasi-experiment: the same players, in the same ballparks, facing the same pitchers, experienced both systems within the same seasons. Our central research question was: **does exposure to Full ABS versus the Challenge system have a measurable effect on batter on-base percentage or plate discipline?**
+
+We chose OBP as the primary outcome metric because it captures all three paths to reaching base that a batter controls (hits, walks, hit-by-pitch) while excluding outcomes driven primarily by the defense. Secondary outcomes — chase rate, zone swing rate, and take rate — were examined to understand whether any OBP effect was accompanied by changes in plate discipline.
+
+**Managerial relevance:** This question matters because MLB’s ABS design choice is not just a technology decision; it changes how players, umpires, fans, and front offices experience the strike zone. If one system meaningfully changes OBP, then MLB teams would need to adjust how they evaluate hitters across ABS environments. If the systems produce similar offensive outcomes, then MLB can make the choice on other dimensions: game flow, fan engagement, strategic drama, operational simplicity, and trust in the call. And that last point matters more than it might seem — offense drives attendance/viewership. Hits, walks, and baserunners create the action that keeps fans engaged. If MLB is choosing between two umpiring systems and one demonstrably suppresses offensive production, that’s not just an analytics question, it’s a revenue question. 
+
+# Data
+
+```{r load-data}
+# Pitch-level Statcast data spanning 2023–2025; cast game_date immediately so all
+# downstream date comparisons work without repeated conversion
+df <- read_csv(URL_STATCAST, show_col_types = FALSE) |>
+  mutate(game_date = as.Date(game_date))
+
+# One row per game mapping each game_pk to its home venue; used for venue-level checks
+venue_games <- read_csv(URL_VENUE, show_col_types = FALSE) |>
+  mutate(game_date = as.Date(game_date))
+
+# Player dimension table: MLBAM player_id → full_name; used for plot titles
+players_dim <- read_csv(URL_PLAYERS, show_col_types = FALSE)
+```
+
+## Raw Data Description
+
+Three source files are used in this analysis, all located in the `data/` directory.
+
+**`statcast_aaa_2023_2024_2025_combined.csv`** — Pitch-level Statcast data for Triple-A (AAA) games spanning the 2023, 2024, and 2025 seasons. Each row represents one pitch and includes:
+
+- `game_pk`, `game_date`, `game_year`, `game_type` — game identifier and metadata
+- `at_bat_number`, `pitch_number` — position of the pitch within the game and at-bat
+- `batter`, `pitcher` — MLBAM player IDs for the batter and pitcher
+- `home_team` — three-letter abbreviation of the home team
+- `pitch_name`, `type` — pitch classification (`type`: B = ball, S = strike, X = in play)
+- `description`, `events` — outcome of the individual pitch and the plate appearance (populated only on the final pitch of each at-bat)
+- `plate_x`, `plate_z` — horizontal and vertical pitch location at home plate, in feet from the center of the plate
+- `sz_top`, `sz_bot` — top and bottom of the batter's personal strike zone, in feet
+
+**`aaa_venue_games.csv`** — One row per game, mapping each `game_pk` to its host venue. Key columns: `game_pk`, `game_date`, `season`, `home_team`, `venue_id`.
+
+**`players_dim_2023_2025.csv`** — Player dimension table: `player_id` (MLBAM numeric ID, joins to `batter` and `pitcher`) and `full_name` (used in plot titles).
+
+**`images/batter.png`** — A static illustration of a batter from the catcher's perspective, used as the background in the edge pitch and swing rate heatmap plots. The strike zone corners were manually measured in the image to create a coordinate mapping between Statcast pitch locations (in feet) and pixel positions on the image.
+
+## Filtering and ABS Assignment
+
+The analysis window covers regular season games from **2023-04-01** through **2024-06-24**, encompassing the full 2023 AAA season and the first two months of 2024 before the league suspended the alternating-day pilot. Players who appeared as both a batter and a pitcher in the dataset were removed, since their hitting stats would be mixed in with their pitching appearances and wouldn't represent a clean batter sample.
+
+Full ABS is coded from the league schedule as weekday ABS games and Challenge is coded as weekend Challenge games. In the data, this is operationalized using `game_date` day-of-week. We validate the assignment below by showing the count of games by day-of-week and assigned ABS type.
+
+```{r filter}
+# Identify players who appear as both batter and pitcher; the same MLBAM ID in
+# both columns indicates a two-way player who must be excluded from batter analysis
+two_way_ids <- intersect(unique(df$batter), unique(df$pitcher))
+
+filtered <- df |>
+  filter(
+    game_date >= as.Date("2023-04-01"),  # start of 2023 AAA regular season
+    game_date <= as.Date("2024-06-24"),  # end of analysis window
+    game_type == "R",                    # regular season only (excludes playoffs/exhibitions)
+    !batter %in% two_way_ids            # drop two-way players
+  ) |>
+  # Assign ABS type by day of week: Mon–Thu (days 1–4) = ABS, Fri–Sun (days 5–7) = Challenge
+  mutate(
+    dow      = wday(game_date, label = TRUE, abbr = TRUE, week_start = 1),
+    dow_num  = wday(game_date, week_start = 1),
+    abs_type = if_else(dow_num <= 4, "ABS", "Challenge")
+  )
+
+# Apply the same date window to venue-game data for consistent coverage checks
+venue_games_filtered <- venue_games |>
+  filter(
+    game_date >= as.Date("2023-04-01"),
+    game_date <= as.Date("2024-06-24")
+  )
+```
+
+## ABS Assignment Validation
+
+The table and plot below confirm the day-of-week assignment rule. Every Monday through Thursday game is coded as Full ABS; every Friday through Sunday game is coded as Challenge.
+
+```{r abs-validation-table}
+# One row per game_pk for the unique-game count; pitch rows are many-to-one
+filtered |>
+  distinct(game_pk, game_date, dow, abs_type) |>
+  count(dow, abs_type, name = "Games") |>
+  arrange(match(dow, c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"))) |>
+  rename(`Day of Week` = dow, `ABS Type` = abs_type) |>
+  knitr::kable(booktabs = TRUE,
+               caption = "Game counts by day of week and assigned ABS type")
+```
+
+```{r abs-validation-plot, fig.height=3.5, fig.cap="Games by day of week, colored by assigned ABS type. Full ABS (blue) covers Mon–Thu; Challenge (red) covers Fri–Sun."}
+filtered |>
+  distinct(game_pk, game_date, dow, abs_type) |>
+  count(dow, abs_type) |>
+  mutate(dow = factor(dow, levels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"))) |>
+  ggplot(aes(x = dow, y = n, fill = abs_type)) +
+  geom_col(width = 0.7) +
+  scale_fill_manual(values = c(ABS = "steelblue", Challenge = "tomato")) +
+  labs(title = "Game Count by Day of Week and ABS Assignment",
+       x = "Day of Week", y = "Number of Games", fill = "ABS Type") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom", plot.title = element_text(hjust = 0.5))
+```
+
+```{r last-pitch-per-ab}
+# Reduce to one row per at-bat by keeping the pitch with the highest pitch_number.
+# with_ties = FALSE guarantees exactly one row even if duplicate pitch numbers exist.
+# The final pitch carries the `events` value that records the at-bat outcome.
+last_pitch_per_ab <- filtered |>
+  group_by(game_pk, at_bat_number) |>
+  slice_max(pitch_number, n = 1, with_ties = FALSE) |>
+  ungroup()
+```
+
+```{r event-summary}
+# Aggregate counting stats per batter × ABS type. Standard baseball definitions:
+#   hits      = 1B + 2B + 3B + HR
+#   walks     = BB + intentional BB
+#   at_bats   = all PA outcomes that count as an AB (excludes BB, HBP, SF)
+#   sac_flies = SF and SF that end a double play (SF_DP)
+# na.rm = TRUE because non-terminal pitches have NA in `events`
+event_summary <- last_pitch_per_ab |>
+  group_by(batter, abs_type) |>
+  summarise(
+    games_played = n_distinct(game_pk),
+    hits         = sum(events %in% c("single", "double", "triple", "home_run"),         na.rm = TRUE),
+    walks        = sum(events %in% c("walk", "intent_walk"),                             na.rm = TRUE),
+    hbp          = sum(events == "hit_by_pitch",                                         na.rm = TRUE),
+    at_bats      = sum(events %in% c("single", "double", "triple", "home_run",
+                                      "strikeout", "strikeout_double_play",
+                                      "field_out", "force_out", "grounded_into_double_play",
+                                      "double_play", "triple_play",
+                                      "fielders_choice", "fielders_choice_out",
+                                      "field_error"),                                    na.rm = TRUE),
+    sac_flies    = sum(events %in% c("sac_fly", "sac_fly_double_play"),                  na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r obp-calc}
+# Compute OBP = (H + BB + HBP) / (AB + BB + HBP + SF) for each batter × ABS cell.
+# filter(!is.nan) drops rows where the denominator is zero (batter had no PA in
+# that cell), which would produce NaN rather than NA from the division.
+obp_data <- event_summary |>
+  mutate(obp = (hits + walks + hbp) / (at_bats + walks + hbp + sac_flies)) |>
+  filter(!is.nan(obp))
+```
+
+```{r player-month-abs}
+# Attach calendar month integer (1–12) so we can group at the month level
+last_pitch_per_ab_month <- last_pitch_per_ab |>
+  mutate(month = month(game_date))
+
+# Aggregate counting stats to the (batter, season, month, abs_type) cell.
+# pa = total plate appearances = AB + BB + HBP + SF (OBP denominator).
+# OBP is set to NA when a player has zero plate appearances in a cell.
+player_month_abs <- last_pitch_per_ab_month |>
+  group_by(batter, game_year, month, abs_type) |>
+  summarise(
+    games_played = n_distinct(game_pk),
+    hits         = sum(events %in% c("single", "double", "triple", "home_run"),         na.rm = TRUE),
+    walks        = sum(events %in% c("walk", "intent_walk"),                             na.rm = TRUE),
+    hbp          = sum(events == "hit_by_pitch",                                         na.rm = TRUE),
+    at_bats      = sum(events %in% c("single", "double", "triple", "home_run",
+                                      "strikeout", "strikeout_double_play",
+                                      "field_out", "force_out", "grounded_into_double_play",
+                                      "double_play", "triple_play",
+                                      "fielders_choice", "fielders_choice_out",
+                                      "field_error"),                                    na.rm = TRUE),
+    sac_flies    = sum(events %in% c("sac_fly", "sac_fly_double_play"),                  na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    pa  = at_bats + walks + hbp + sac_flies,
+    obp = if_else(pa > 0, (hits + walks + hbp) / pa, NA_real_)
+  )
+
+# Determine main PA threshold.
+# Use 30 PA if at least 100 matched player-month pairs survive (enough for a stable
+# within-player mean); otherwise fall back to 15 PA.
+pa30_matched <- player_month_abs |>
+  filter(pa >= 30L, !(game_year == 2024 & month == 3)) |>
+  select(batter, game_year, month, abs_type, obp) |>
+  pivot_wider(names_from = abs_type, values_from = obp) |>
+  filter(!is.na(ABS), !is.na(Challenge)) |>
+  nrow()
+
+PA_MIN <- if (pa30_matched >= 100L) 30L else 15L
+
+player_month_abs_filtered <- player_month_abs |>
+  filter(pa >= PA_MIN, !(game_year == 2024 & month == 3))
+
+# Build a labelled factor so ridges sort chronologically as "Apr 2023", "May 2023", …
+player_month_abs_filtered <- player_month_abs_filtered |>
+  mutate(
+    year_month = factor(
+      format(as.Date(paste(game_year, month, "01", sep = "-")), "%b %Y"),
+      levels = format(
+        seq(as.Date("2023-04-01"), as.Date("2024-06-01"), by = "month"),
+        "%b %Y"
+      )
+    )
+  )
+
+# Within-player monthly OBP difference
+obp_diff_month <- player_month_abs_filtered |>
+  select(batter, game_year, month, year_month, abs_type, obp) |>
+  pivot_wider(names_from = abs_type, values_from = obp) |>
+  filter(!is.na(ABS), !is.na(Challenge)) |>
+  mutate(obp_diff = ABS - Challenge) |>
+  arrange(game_year, month, batter)
+```
+
+## Dataset Overview
+
+```{r dataset-overview}
+# Build a named two-column tibble of high-level coverage statistics, then render
+# as a PDF-friendly table. floor_date(..., "month") groups dates to the 1st of
+# each month, so n_distinct counts calendar months rather than individual dates.
+tibble(
+  Statistic = c(
+    "Records in range", "Total records",
+    "Date min", "Date max",
+    "Unique game dates", "Unique game PKs",
+    "Unique batters", "Unique pitchers",
+    "Unique home teams", "Unique months"
+  ),
+  Value = c(
+    nrow(filtered), nrow(df),
+    as.character(min(filtered$game_date)),
+    as.character(max(filtered$game_date)),
+    n_distinct(filtered$game_date),
+    n_distinct(filtered$game_pk),
+    n_distinct(filtered$batter),
+    n_distinct(filtered$pitcher),
+    n_distinct(filtered$home_team),
+    n_distinct(floor_date(filtered$game_date, "month"))
+  )
+) |>
+  knitr::kable(booktabs = TRUE, caption = "Date range and coverage summary")
+```
+
+```{r distinct-counts}
+filtered |>
+  summarise(
+    Pitchers = n_distinct(pitcher),
+    Batters  = n_distinct(batter),
+    Games    = n_distinct(game_pk),
+    Days     = n_distinct(game_date)
+  ) |>
+  knitr::kable(booktabs = TRUE, caption = "Distinct entity counts")
+```
+
+```{r records-per-year}
+filtered |>
+  count(game_year, name = "Pitch Records") |>
+  rename(Year = game_year) |>
+  knitr::kable(booktabs = TRUE, caption = "Pitch records per game year")
+```
+
+## Data Quality
+
+```{r data-quality-table}
+# Key pitch-level columns used in the analysis and their missing-value counts
+dq <- tibble(
+  Column      = c("plate_x", "plate_z", "sz_top", "sz_bot",
+                  "events", "pitch_name", "abs_type"),
+  Description = c("Horizontal pitch location (ft)",
+                  "Vertical pitch location (ft)",
+                  "Strike zone top (ft)",
+                  "Strike zone bottom (ft)",
+                  "Plate-appearance outcome (terminal pitches only)",
+                  "Statcast pitch classification",
+                  "ABS system assignment (derived)"),
+  `N Missing` = c(
+    sum(is.na(filtered$plate_x)),
+    sum(is.na(filtered$plate_z)),
+    sum(is.na(filtered$sz_top)),
+    sum(is.na(filtered$sz_bot)),
+    sum(is.na(filtered$events) | filtered$events == ""),
+    sum(is.na(filtered$pitch_name) | filtered$pitch_name == ""),
+    sum(is.na(filtered$abs_type))
+  ),
+  `% Missing` = round(c(
+    mean(is.na(filtered$plate_x)),
+    mean(is.na(filtered$plate_z)),
+    mean(is.na(filtered$sz_top)),
+    mean(is.na(filtered$sz_bot)),
+    mean(is.na(filtered$events) | filtered$events == ""),
+    mean(is.na(filtered$pitch_name) | filtered$pitch_name == ""),
+    mean(is.na(filtered$abs_type))
+  ) * 100, 1)
+)
+
+knitr::kable(dq, booktabs = TRUE,
+             caption = "Missing-value audit for key analysis columns (filtered dataset)")
+```
+
+Pitch location columns with missing values are excluded from the edge-pitch and heatmap analyses. The `events` column is intentionally blank on non-final pitches — only the last pitch of each plate appearance records the outcome. `abs_type` is fully populated by construction.
+
+These checks support the core analysis: every pitch has an ABS type assigned, OBP is built from the final pitch of each plate appearance where outcomes are defined, and missing location data only affects the mechanism visuals — not the headline OBP comparison.
+
+## Team and Venue Summaries
+
+```{r unique-teams, results='asis'}
+teams <- filtered |>
+  distinct(home_team) |>
+  arrange(home_team) |>
+  pull(home_team)
+
+cat(paste(teams, collapse = ", "))
+```
+
+# Identification and Scope of Claim
+
+ABS was not randomly assigned to individual players — it was assigned by day of week for the whole league. That said, the pilot schedule exposed the same teams, and many of the same batters, to both systems within the same season. Our strongest comparison is within-player: we compare each batter's performance under Full ABS to their own performance under the Challenge System within the same calendar month. This controls for differences in player quality and reduces the influence of seasonality, but it doesn't eliminate every potential confound. Weekday vs. weekend differences in pitching matchups, travel, rest, and roster composition could still play a role. We treat these results as strong observational evidence — not a controlled experiment, but a well-structured comparison.
+
+## Analysis Roadmap
+
+```{r analysis-roadmap, echo=FALSE}
+tibble(
+  Analysis             = c("OBP by ABS type",
+                           "Full-period within-player OBP",
+                           "Player-month OBP",
+                           "PA threshold sensitivity",
+                           "Edge pitch plots",
+                           "Swing discipline",
+                           "Pitch mix"),
+  Unit                 = c("Batter $\\times$ ABS type",
+                           "Batter",
+                           "Batter $\\times$ month $\\times$ ABS type",
+                           "Batter $\\times$ month $\\times$ ABS type",
+                           "Pitch",
+                           "Batter $\\times$ ABS type",
+                           "Batter $\\times$ ABS type"),
+  `Comparison Type`    = c("Grouped comparison",
+                           "Paired difference",
+                           "Paired difference",
+                           "Robustness check",
+                           "Illustrative mechanism visual",
+                           "Within-player paired difference",
+                           "Robustness / balance check"),
+  Outcome              = c("OBP",
+                           "$\\text{OBP}_{\\text{ABS}} - \\text{OBP}_{\\text{Challenge}}$",
+                           "$\\text{OBP}_{\\text{ABS}} - \\text{OBP}_{\\text{Challenge}}$",
+                           "OBP difference",
+                           "Location and swing behavior",
+                           "Chase, take, zone swing",
+                           "Ball, strike, in-play share"),
+  `Why It Matters`     = c("Establishes the aggregate offensive baseline.",
+                           "Compares the same hitter across systems.",
+                           "Main specification; controls for month-level form and roster movement.",
+                           "Tests whether the main estimate depends on the PA cutoff.",
+                           "Shows where ABS should matter most if it changes behavior.",
+                           "Tests whether approach changes even when OBP does not.",
+                           "Checks whether batters faced different pitch environments.")
+) |>
+  knitr::kable(booktabs = TRUE, escape = FALSE,
+               caption  = "Analysis roadmap: each row corresponds to one section of the results.")
+```
+
+# On-Base Percentage Results - Full Period Look
+
+OBP is calculated as $(H + BB + HBP) \div (AB + BB + HBP + SF)$. This section covers the overall OBP distribution, compares OBP between the two systems at the aggregate level, and then looks at within-player differences — the main result.
+
+> **Note:** The summary statistics and distributional plots in this section include all batters in the filtered dataset regardless of plate-appearance volume. No minimum-PA threshold is applied here. The PA threshold (30 PA per batter-month cell in the main specification) is introduced in the Player-Month analysis in Section 5, where it is needed to ensure stable within-player OBP estimates.
+
+## Summary Statistics
+
+```{r event-stats-compute}
+# across() applies the same five summary functions to every selected column at once.
+# The regex names_sep "_(?=[^_]+$)" splits on the last underscore so that
+# multi-word column names like "games_played" stay intact as the metric label.
+event_stats <- event_summary |>
+  ungroup() |>
+  select(games_played, hits, walks, hbp, at_bats, sac_flies) |>
+  summarise(across(everything(), list(
+    mean   = \(x) round(mean(x),   2),
+    median = \(x) round(median(x), 2),
+    sd     = \(x) round(sd(x),     2),
+    min    = \(x) round(min(x),    2),
+    max    = \(x) round(max(x),    2)
+  ))) |>
+  pivot_longer(everything(),
+               names_to  = c("metric", "stat"),
+               names_sep = "_(?=[^_]+$)") |>
+  pivot_wider(names_from = stat, values_from = value) |>
+  mutate(across(where(is.numeric), \(x) round(x, 2)))
+```
+
+```{r obp-summary-table}
+# Construct a single-row OBP summary and stack it with the counting-stat rows
+obp_row <- obp_data |>
+  summarise(
+    metric = "OBP",
+    mean   = round(mean(obp),   4),
+    median = round(median(obp), 4),
+    sd     = round(sd(obp),     4),
+    min    = round(min(obp),    4),
+    max    = round(max(obp),    4)
+  )
+
+bind_rows(event_stats, obp_row) |>
+  rename(Metric = metric, Mean = mean, Median = median, SD = sd, Min = min, Max = max) |>
+  knitr::kable(booktabs = TRUE, caption = "Summary statistics for batter counting stats and OBP")
+```
+
+## Overall OBP Distribution
+
+```{r obp-histogram, fig.cap="Overall OBP distribution across all batters and treatments."}
+# Compute overall mean and median to use as reference lines on the histogram
+obp_refs <- obp_data |>
+  summarise(mean = mean(obp), median = median(obp))
+
+obp_data |>
+  ggplot(aes(x = obp)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  geom_vline(data = tibble(val  = c(obp_refs$mean, obp_refs$median),
+                            stat = c("Mean", "Median")),
+             aes(xintercept = val, color = stat), linewidth = 0.8) +
+  scale_color_manual(name = "", values = c(Mean = "red", Median = "orange")) +
+  scale_x_continuous(labels = scales::number_format(accuracy = 0.0001)) +
+  labs(title = "On-Base Percentage Distribution (2023-04-01 to 2024-06-24)",
+       x = "OBP", y = "Number of Batters") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom", plot.title = element_text(hjust = 0.5))
+```
+
+The pooled OBP distribution has a mean of approximately 0.34 and a median near 0.35, consistent with league-average offensive production in affiliated minor league play.
+
+## OBP by ABS Type
+
+```{r obp-violin, fig.cap="OBP distribution by ABS system type. The inner boxplot marks median and IQR."}
+obp_data |>
+  ggplot(aes(x = abs_type, y = obp, fill = abs_type)) +
+  geom_violin(trim = FALSE, alpha = 0.3) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA) +
+  scale_fill_manual(values = c(ABS = "steelblue", Challenge = "tomato")) +
+  labs(title = "OBP Distribution by ABS Type (2023-04-01 to 2024-06-24)",
+       x = "ABS Type", y = "OBP") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5))
+```
+
+The violin plot shows that OBP under Full ABS and the Challenge System looks nearly the same in aggregate. Both distributions are centered near a median of 0.33–0.35, and the middle 50% of values overlap almost completely. This aggregate view doesn't account for which players happened to play more under one system, so any small difference here could just reflect roster composition rather than the systems themselves.
+
+```{r obp-density, fig.cap="Overlapping OBP density curves for ABS vs. Challenge."}
+obp_data |>
+  ggplot(aes(x = obp, fill = abs_type, color = abs_type)) +
+  geom_density(alpha = 0.4) +
+  scale_fill_manual(values  = c(ABS = "steelblue", Challenge = "tomato")) +
+  scale_color_manual(values = c(ABS = "steelblue", Challenge = "tomato")) +
+  labs(title = "OBP Density by ABS Type (2023-04-01 to 2024-06-24)",
+       x = "OBP", y = "Density", fill = "ABS Type", color = "ABS Type") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom", plot.title = element_text(hjust = 0.5))
+```
+
+The density curves tell the same story as the violin plot: the two distributions overlap almost entirely. The shapes and peaks are nearly identical — though this combined view doesn't separate out individual player performance, so it can't tell us whether the same players performed differently under each system.
+
+## Within-Player OBP Difference: Full ABS − Challenge
+
+The most direct test compares each batter's OBP under Full ABS to their own OBP under the Challenge System. Each batter contributes one data point — their personal difference — so differences in overall player skill are factored out. Players who didn't appear under both systems are excluded.
+
+```{r obp-diff-density, fig.cap="Density of per-batter OBP difference (Full ABS minus Challenge). Shaded band = 95% CI on the mean; dashed line at 0 = no difference."}
+# Pivot obp_data wide so each batter has one OBP column per abs_type, then
+# subtract to get the per-batter within-player treatment difference.
+obp_diff <- obp_data |>
+  select(batter, abs_type, obp) |>
+  pivot_wider(names_from = abs_type, values_from = obp) |>
+  filter(!is.na(ABS), !is.na(Challenge)) |>
+  mutate(obp_diff = ABS - Challenge) |>
+  arrange(desc(obp_diff))
+
+# 95% CI on the mean: mean ± t*(0.975, df = n−1) × (sd / √n)
+obp_diff_ci <- obp_diff |>
+  summarise(
+    n      = n(),
+    mean   = mean(obp_diff),
+    sd     = sd(obp_diff),
+    se     = sd / sqrt(n),
+    t_crit = qt(0.975, df = n - 1),
+    ci_lo  = mean - t_crit * se,
+    ci_hi  = mean + t_crit * se
+  )
+
+obp_diff |>
+  ggplot(aes(x = obp_diff)) +
+  # Shaded 95% CI band on the mean
+  geom_rect(data = obp_diff_ci,
+            aes(xmin = ci_lo, xmax = ci_hi, ymin = -Inf, ymax = Inf),
+            fill = "tomato", alpha = 0.15, inherit.aes = FALSE) +
+  geom_density(fill = "steelblue", color = "steelblue", alpha = 0.4) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black",
+             linewidth = 0.8) +
+  geom_vline(data = obp_diff_ci, aes(xintercept = mean),
+             linetype = "dashed", color = "red", linewidth = 0.8) +
+  annotate("text",
+           x      = obp_diff_ci$ci_hi,
+           y      = Inf,
+           label  = paste0("95% CI [",
+                           sprintf("%+.4f", obp_diff_ci$ci_lo), ", ",
+                           sprintf("%+.4f", obp_diff_ci$ci_hi), "]",
+                           "\nMean = ", sprintf("%+.4f", obp_diff_ci$mean),
+                           "  n = ", obp_diff_ci$n),
+           hjust  = -0.05, vjust = 1.4, size = 3.2, family = "mono") +
+  labs(title = "Within-Player OBP Difference (Full ABS − Challenge)",
+       x = "OBP Difference (ABS − Challenge)", y = "Density") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+The distribution is centered near zero — the red dashed line marks the mean and the shaded band shows the 95% confidence interval on the mean. The mean is slightly positive (Full ABS above Challenge), but the confidence interval includes zero, so we can't rule out that this is just random variation in the sample. The distribution is symmetric and bell-shaped, which is consistent with small, uncertain differences rather than a clear directional effect.
+
+*Note: This plot aggregates each batter's stats across the full analysis window with no plate appearance minimum, so n here reflects the number of batters who appeared under both systems at any point during the season. The monthly analysis in Section 5 applies a minimum of `r PA_MIN` PA per batter-month-ABS cell, which produces a different (smaller) n by design.*
+
+# Player-Month-ABS: Monthly Analysis
+
+To get a tighter comparison, we broke OBP down by player, season, month, and ABS type. Looking within calendar months means we're comparing ABS and Challenge performance over the same time window, which reduces the impact of injuries, roster moves, and hot or cold stretches. We required at least **`r PA_MIN` plate appearances** per cell to make sure each OBP estimate was based on a meaningful sample.
+
+```{r pma-overview}
+tibble(
+  Statistic = c("Total rows", "Unique batters", "Unique months",
+                "Rows (post PA filter)", "Batters (post PA filter)",
+                "Rows dropped", "Pct dropped (%)"),
+  Value = c(
+    nrow(player_month_abs),
+    n_distinct(player_month_abs$batter),
+    n_distinct(player_month_abs$month),
+    nrow(player_month_abs_filtered),
+    n_distinct(player_month_abs_filtered$batter),
+    nrow(player_month_abs) - nrow(player_month_abs_filtered),
+    round((1 - nrow(player_month_abs_filtered) / nrow(player_month_abs)) * 100, 1)
+  )
+) |>
+  knitr::kable(booktabs = TRUE, caption = "Player-month-ABS dataset overview and PA filter summary")
+```
+
+## OBP Distribution by Year-Month
+
+The monthly breakdown lets us see whether the small OBP difference is concentrated in a specific month or spread evenly across the whole period.
+
+```{r obp-ridgeline-yearmonth, fig.height=7, fig.cap="OBP distribution by calendar month and ABS type. Median line shown through each ridge."}
+ggplot(player_month_abs_filtered,
+       aes(x = obp, y = fct_rev(year_month), fill = abs_type)) +
+  geom_density_ridges(alpha = 0.5, scale = 0.9, rel_min_height = 0.01,
+                      quantile_lines = TRUE, quantiles = 2) +
+  scale_fill_manual(values = c(ABS = "steelblue", Challenge = "tomato")) +
+  labs(title = "OBP Distribution by Year-Month and ABS Type",
+       x = "OBP", y = NULL, fill = "ABS Type") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom", plot.title = element_text(hjust = 0.5))
+```
+
+In every month of the analysis window, the ABS and Challenge distributions overlap closely. No month shows a consistent directional separation. September 2023 had the largest difference in value due in great part to a drop in instances leading to greater variability, as the league hosts their playoffs then (Sept 6th-21st) and we are only looking at regular season.
+
+## OBP Summary by Year-Month
+
+```{r obp-month-summary-table}
+obp_month_summary <- player_month_abs_filtered |>
+  group_by(year_month, abs_type) |>
+  summarise(
+    n      = n(),
+    mean   = round(mean(obp,   na.rm = TRUE), 4),
+    median = round(median(obp, na.rm = TRUE), 4),
+    sd     = round(sd(obp,     na.rm = TRUE), 4),
+    min    = round(min(obp,    na.rm = TRUE), 4),
+    max    = round(max(obp,    na.rm = TRUE), 4),
+    .groups = "drop"
+  ) |>
+  arrange(year_month, abs_type)
+
+obp_month_summary |>
+  rename(`Year-Month` = year_month, `ABS Type` = abs_type,
+         N = n, Mean = mean, Median = median, SD = sd, Min = min, Max = max) |>
+  knitr::kable(booktabs = TRUE,
+               caption  = "OBP summary statistics by year-month and ABS type")
+```
+
+## Within-Player OBP Difference by Month
+
+To sharpen the comparison, we computed each batter's OBP difference for each individual calendar month where they hit the `r PA_MIN` PA minimum under both systems. This rules out the chance that a player's overall difference was just because they happened to be hot or cold during a stretch when one system was in play.
+
+```{r obp-diff-density-overall, fig.cap="Density of within-player OBP difference (ABS minus Challenge) across all months. Shaded band = 95% CI on the mean; dashed line at 0 = no difference."}
+obp_diff_month_ci <- obp_diff_month |>
+  summarise(
+    n      = n(),
+    mean   = mean(obp_diff),
+    sd     = sd(obp_diff),
+    se     = sd / sqrt(n),
+    t_crit = qt(0.975, df = n - 1),
+    ci_lo  = mean - t_crit * se,
+    ci_hi  = mean + t_crit * se
+  )
+
+obp_diff_month |>
+  ggplot(aes(x = obp_diff)) +
+  geom_rect(data = obp_diff_month_ci,
+            aes(xmin = ci_lo, xmax = ci_hi, ymin = -Inf, ymax = Inf),
+            fill = "tomato", alpha = 0.15, inherit.aes = FALSE) +
+  geom_density(fill = "steelblue", color = "steelblue", alpha = 0.4) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  geom_vline(data = obp_diff_month_ci, aes(xintercept = mean),
+             linetype = "dashed", color = "red", linewidth = 0.8) +
+  annotate("text",
+           x      = obp_diff_month_ci$ci_hi,
+           y      = Inf,
+           label  = paste0("95% CI [",
+                           sprintf("%+.4f", obp_diff_month_ci$ci_lo), ", ",
+                           sprintf("%+.4f", obp_diff_month_ci$ci_hi), "]",
+                           "\nMean = ", sprintf("%+.4f", obp_diff_month_ci$mean),
+                           "  n = ", obp_diff_month_ci$n),
+           hjust  = -0.05, vjust = 1.4, size = 3.2, family = "mono") +
+  labs(title = "Distribution of Within-Player OBP Difference (ABS − Challenge)",
+       x = "OBP Difference (ABS − Challenge)", y = "Density") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+The monthly within-player difference distribution shows a small positive mean (Full ABS above Challenge), consistent with the full-season result. The confidence interval is tighter here than in the full-season view, but whether it includes zero depends on how we set the minimum plate appearance cutoff — see the robustness check below.
+
+```{r obp-diff-ridgeline-month, fig.height=7, fig.cap="Within-player OBP difference by calendar month. Dashed line at 0; median line through each ridge."}
+obp_diff_month |>
+  ggplot(aes(x = obp_diff, y = fct_rev(year_month))) +
+  geom_density_ridges(fill = "steelblue", alpha = 0.5, scale = 0.9,
+                      rel_min_height = 0.01,
+                      quantile_lines = TRUE, quantiles = 2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", linewidth = 0.25) +
+  labs(title = "Within-Player OBP Difference by Month (ABS − Challenge)",
+       x = "OBP Difference (ABS − Challenge)", y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+The month-by-month ridgeline shows no month with a large or consistent directional separation. The small positive mean seen in the pooled distribution is not concentrated in any single month, suggesting it is not driven by an isolated hot or cold stretch.
+
+## PA Threshold Sensitivity
+
+```{r pa-threshold-note, results='asis'}
+# Emit the appropriate rationale paragraph depending on which PA_MIN was chosen
+if (PA_MIN == 30L) {
+  cat("The main specification requires at least **30 plate appearances** per batter-month-ABS cell. The 15-PA and 50-PA specifications are treated as robustness checks. As shown in the forest plot below, the sign and magnitude of the OBP difference are sensitive to this choice: the 30-PA estimate is slightly positive, but the 50-PA estimate reverses sign. The OBP finding should therefore be interpreted as fragile rather than robust.")
+} else {
+  cat(paste0(
+    "The main specification requires at least **", PA_MIN,
+    " plate appearances** per batter-month-ABS cell, because 30 PA yields fewer than 100 matched player-months. ",
+    "Robustness checks at 30 and 50 PA are presented below. ",
+    "The OBP difference is sensitive to the choice of threshold and should not be interpreted as a stable finding."
+  ))
+}
+```
+
+```{r pa-robustness-compute}
+# For each PA threshold, compute the within-player OBP difference distribution
+thresholds <- c(15L, 30L, 50L)
+
+robustness_tbl <- map_dfr(thresholds, function(thresh) {
+  diffs <- player_month_abs |>
+    filter(pa >= thresh, !(game_year == 2024 & month == 3)) |>
+    select(batter, game_year, month, abs_type, obp) |>
+    pivot_wider(names_from = abs_type, values_from = obp) |>
+    filter(!is.na(ABS), !is.na(Challenge)) |>
+    mutate(obp_diff = ABS - Challenge)
+
+  n  <- nrow(diffs)
+  mu <- mean(diffs$obp_diff)
+  md <- median(diffs$obp_diff)
+  s  <- sd(diffs$obp_diff)
+  se <- s / sqrt(n)
+  tc <- qt(0.975, df = max(n - 1L, 1L))
+
+  tibble(
+    threshold = thresh,
+    n         = n,
+    mean_diff = mu,
+    med_diff  = md,
+    se        = se,
+    ci_lo     = mu - tc * se,
+    ci_hi     = mu + tc * se
+  )
+})
+```
+
+```{r pa-robustness-table}
+robustness_tbl |>
+  mutate(
+    Main = if_else(threshold == PA_MIN, "*", ""),
+    across(c(mean_diff, med_diff, se, ci_lo, ci_hi), \(x) round(x, 4))
+  ) |>
+  rename(
+    `PA Min`   = threshold,
+    `N Pairs`  = n,
+    `Mean Diff` = mean_diff,
+    `Median`   = med_diff,
+    SE         = se,
+    `95% CI Lo` = ci_lo,
+    `95% CI Hi` = ci_hi,
+    `Main`     = Main
+  ) |>
+  knitr::kable(
+    booktabs = TRUE,
+    caption  = "Within-player OBP difference (ABS − Challenge) by PA threshold. * = main specification."
+  )
+```
+
+```{r pa-robustness-plot, fig.height=3.2, fig.cap="Forest plot of within-player OBP difference by PA threshold. Points = mean; bars = 95% CI; dashed line = zero. Filled circle = main specification; open circle = robustness check."}
+robustness_tbl |>
+  mutate(
+    label   = paste0(threshold, " PA  (n = ", scales::comma(n), ")"),
+    label   = fct_reorder(label, threshold),
+    is_main = (threshold == PA_MIN)
+  ) |>
+  ggplot(aes(x = mean_diff, y = label)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40",
+             linewidth = 0.8) +
+  geom_errorbarh(aes(xmin = ci_lo, xmax = ci_hi),
+                 height = 0.25, linewidth = 0.9, color = "steelblue") +
+  # Robustness checks: open circles
+  geom_point(data = ~ filter(.x, !is_main),
+             size = 3.5, shape = 21, color = "steelblue", fill = "white",
+             stroke = 1.2) +
+  # Main specification: filled circle
+  geom_point(data = ~ filter(.x, is_main),
+             size = 3.5, shape = 19, color = "steelblue") +
+  scale_x_continuous(labels = scales::number_format(accuracy = 0.001)) +
+  labs(
+    title = "Robustness to PA Threshold: Within-Player OBP Difference (ABS − Challenge)",
+    x     = "Mean OBP Difference (ABS − Challenge)",
+    y     = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5, size = 11))
+```
+
+The OBP result doesn't hold up cleanly across all PA thresholds. The 15-PA and 30-PA samples show a small positive ABS-minus-Challenge difference, but the stricter 50-PA sample flips to negative and includes zero in the confidence interval. Because the result changes direction under a reasonable alternative filter, we don't treat the positive 30-PA estimate as a reliable finding. The safer takeaway is that OBP differences between the two systems are small and sensitive to how we define the minimum plate appearance cutoff.
+
+# Edge Pitch Analysis
+
+The pitch-location plots in this section are included to illustrate the intuition behind the analysis — they are not the primary evidence for the main finding. OBP and plate-discipline differences are estimated from player-level comparisons pooled across the full sample; the pitch plots simply show where behavioral changes would most likely show up if ABS was actually affecting how batters approach at-bats. Because ABS should matter most near the strike zone boundary, these visuals focus on borderline pitches and swing behavior around the zone.
+
+While OBP differences across ABS systems are small and fragile, pitch location data allows us to visualize whether batters changed their behavior at the margins of the strike zone — the region where automation of ball-strike calls would be most consequential. A pitch is classified as an **edge pitch** if its center falls within 2 inches of any strike zone boundary. The horizontal boundaries are fixed at ±8.5 inches from center; the vertical boundaries use each batter's personal `sz_top` and `sz_bot` measurements.
+
+Operationally, a pitch is classified as in-zone if `plate_x` is between $-8.5/12$ and $+8.5/12$ feet and `plate_z` is between `sz_bot` and `sz_top`. We normalize vertical location as $\tilde{z} = (\texttt{plate\_z} - \texttt{sz\_bot}) \;/\; (\texttt{sz\_top} - \texttt{sz\_bot})$, where 0 is the bottom of the batter-specific zone and 1 is the top. A pitch is classified as an edge pitch if its center is within $2/12$ feet of any strike-zone boundary: either horizontal boundary, the zone bottom, or the zone top.
+
+```{r edge-classification}
+# Zone geometry constants (all in feet):
+#   Home plate is 17 inches wide, centered at 0, so left edge = -(17/2)/12 ft
+#   Edge threshold: 2 inches inside or outside any zone boundary
+EDGE_FT  <- 2 / 12
+SZ_LEFT  <- -(17 / 2) / 12
+SZ_RIGHT <-  (17 / 2) / 12
+
+filtered_edge <- filtered |>
+  filter(!is.na(plate_x), !is.na(plate_z), !is.na(sz_top), !is.na(sz_bot)) |>
+  mutate(
+    # TRUE if the pitch center falls inside the rectangular strike zone
+    in_zone  = plate_x >= SZ_LEFT & plate_x <= SZ_RIGHT &
+               plate_z >= sz_bot  & plate_z <= sz_top,
+
+    # Distance from pitch center to the nearest point on the zone perimeter
+    dist_to_boundary = if_else(
+      in_zone,
+      pmin(plate_x - SZ_LEFT, SZ_RIGHT - plate_x,
+           plate_z - sz_bot,  sz_top   - plate_z),
+      sqrt((plate_x - pmax(SZ_LEFT, pmin(SZ_RIGHT, plate_x)))^2 +
+           (plate_z - pmax(sz_bot,  pmin(sz_top,   plate_z)))^2)
+    ),
+
+    # Edge pitch: within 2 inches of any zone boundary (inside or outside)
+    is_edge  = dist_to_boundary <= EDGE_FT,
+
+    # Swing: batter offered at the pitch
+    is_swing = description %in% c("hit_into_play", "swinging_strike",
+                                   "swinging_strike_blocked", "foul",
+                                   "foul_tip", "foul_bunt", "missed_bunt")
+  )
+```
+
+```{r edge-summary-table}
+edge_summary <- filtered_edge |>
+  count(in_zone, is_edge) |>
+  mutate(pct = round(n / sum(n) * 100, 1))
+
+edge_summary |>
+  rename(`In Zone` = in_zone, `Is Edge` = is_edge, Count = n, `Share (%)` = pct) |>
+  knitr::kable(booktabs = TRUE, caption = "Pitch counts by zone and edge classification")
+```
+
+```{r edge-scatter, fig.cap="Sample of 15,000 edge pitches. Solid rectangle = strike zone; dashed rectangle = 2-inch edge band. Illustrative guide to the edge-pitch sample; not primary evidence for the main finding."}
+set.seed(42)
+
+# Normalize plate_z to [0, 1] within each batter's personal zone
+filtered_edge_sample <- filtered_edge |>
+  filter(is_edge) |>
+  mutate(plate_z_norm = (plate_z - sz_bot) / (sz_top - sz_bot)) |>
+  slice_sample(n = 15000)
+
+sz_mean_height <- mean(filtered_edge$sz_top - filtered_edge$sz_bot, na.rm = TRUE)
+edge_norm <- EDGE_FT / sz_mean_height
+
+filtered_edge_sample |>
+  ggplot(aes(x = plate_x, y = plate_z_norm, color = description)) +
+  annotate("rect",
+           xmin = SZ_LEFT, xmax = SZ_RIGHT, ymin = 0, ymax = 1,
+           fill = NA, color = "black", linewidth = 0.8) +
+  annotate("rect",
+           xmin = SZ_LEFT - EDGE_FT, xmax = SZ_RIGHT + EDGE_FT,
+           ymin = -edge_norm, ymax = 1 + edge_norm,
+           fill = NA, color = "grey50", linewidth = 0.5, linetype = "dashed") +
+  geom_point(alpha = 0.3, size = 0.6) +
+  coord_fixed() +
+  labs(title  = "Edge Pitch Locations by Description (normalized zone, n = 15,000)",
+       x      = "Horizontal Position (ft, catcher's view)",
+       y      = "Normalized Zone Position (0 = bottom, 1 = top)",
+       color  = "Description") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "right", plot.title = element_text(hjust = 0.5)) +
+  guides(color = guide_legend(override.aes = list(alpha = 1, size = 2)))
+```
+
+This figure is a visual guide to the edge-pitch sample. The solid rectangle marks the rule-book strike zone and the dashed rectangle marks the two-inch edge band. Pitches in this band are the ones most likely to be called differently by a human umpire versus an automated system. The point of this plot isn't to prove anything about the two systems — it's to show that our edge-pitch definition is capturing the right region of the zone.
+
+## Player-Specific Edge Pitch Plots
+
+```{r plot-functions}
+# ── Image calibration ─────────────────────────────────────────────────────────
+IMG_PATH      <- tempfile(fileext = ".png")
+download.file(URL_BATTER_IMG, IMG_PATH, mode = "wb", quiet = TRUE)
+ZONE_LEFT_PX  <- 323
+ZONE_RIGHT_PX <- 423
+ZONE_BOT_PX   <- 355
+ZONE_TOP_PX   <- 169
+
+batter_img <- image_read(IMG_PATH)
+img_info   <- image_info(batter_img)
+img_w      <- img_info$width
+img_h      <- img_info$height
+
+# Linear scale and offset: pitch feet → image pixels
+# ggplot y increases upward; pixel y increases downward → flip with img_h - pixel_y
+px_scale_x <- (ZONE_RIGHT_PX - ZONE_LEFT_PX)  / (SZ_RIGHT - SZ_LEFT)
+px_off_x   <- ZONE_LEFT_PX  - px_scale_x * SZ_LEFT
+px_scale_z <- (ZONE_TOP_PX  - ZONE_BOT_PX)    / (1 - 0)
+px_off_z   <- ZONE_BOT_PX
+
+filtered_edge_px <- filtered_edge_sample |>
+  mutate(
+    px_x = px_scale_x * plate_x      + px_off_x,
+    px_z = img_h - (px_scale_z * plate_z_norm + px_off_z)
+  )
+
+zone_px <- list(
+  left       = px_scale_x * SZ_LEFT              + px_off_x,
+  right      = px_scale_x * SZ_RIGHT             + px_off_x,
+  bot        = img_h - ZONE_BOT_PX,
+  top        = img_h - ZONE_TOP_PX,
+  edge_left  = px_scale_x * (SZ_LEFT  - EDGE_FT) + px_off_x,
+  edge_right = px_scale_x * (SZ_RIGHT + EDGE_FT) + px_off_x,
+  edge_bot   = img_h - (px_scale_z * (-edge_norm) + px_off_z),
+  edge_top   = img_h - (px_scale_z * (1 + edge_norm) + px_off_z)
+)
+
+# Pitches where the batter made a genuine decision (took or swung)
+plate_discipline_desc <- c(
+  "ball", "blocked_ball", "called_strike",
+  "swinging_strike", "swinging_strike_blocked",
+  "foul", "foul_tip", "foul_bunt", "missed_bunt", "hit_into_play"
+)
+
+# ── plot_edge_pitches() ───────────────────────────────────────────────────────
+plot_edge_pitches <- function(player_id, abs_type_filter = NULL, n_sample = 5000) {
+  player_data <- filtered_edge |>
+    filter(batter == player_id, is_edge, description %in% plate_discipline_desc)
+  if (!is.null(abs_type_filter))
+    player_data <- filter(player_data, abs_type == abs_type_filter)
+  if (nrow(player_data) == 0)
+    stop("No edge pitches found for batter ", player_id)
+
+  set.seed(42)
+  player_px <- player_data |>
+    mutate(
+      plate_z_norm = (plate_z - sz_bot) / (sz_top - sz_bot),
+      px_x         = px_scale_x * plate_x      + px_off_x,
+      px_z         = img_h - (px_scale_z * plate_z_norm + px_off_z)
+    ) |>
+    slice_sample(n = min(n_sample, nrow(player_data)))
+
+  player_name  <- players_dim$full_name[match(player_id, players_dim$player_id)]
+  player_label <- if (length(player_name) == 1 && !is.na(player_name)) player_name else as.character(player_id)
+  title_str    <- paste0("Edge Pitch Locations — ", player_label,
+                         if (!is.null(abs_type_filter)) paste0("  [", abs_type_filter, "]") else "  [ABS + Challenge]")
+
+  ggplot(player_px, aes(x = px_x, y = px_z, color = description)) +
+    annotation_raster(as.raster(batter_img), xmin = 0, xmax = img_w, ymin = 0, ymax = img_h) +
+    annotate("rect",
+             xmin = zone_px$edge_left, xmax = zone_px$edge_right,
+             ymin = zone_px$edge_bot,  ymax = zone_px$edge_top,
+             fill = "grey", alpha = 0.15, color = NA) +
+    annotate("rect",
+             xmin = zone_px$edge_left, xmax = zone_px$edge_right,
+             ymin = zone_px$edge_bot,  ymax = zone_px$edge_top,
+             fill = NA, color = "grey", linewidth = 1.0, linetype = "dashed") +
+    annotate("rect",
+             xmin = zone_px$left, xmax = zone_px$right,
+             ymin = zone_px$bot,  ymax = zone_px$top,
+             fill = NA, color = "black", linewidth = 1.2) +
+    geom_point(alpha = 0.5, size = 1.0) +
+    scale_x_continuous(limits = c(0, img_w), expand = c(0, 0)) +
+    scale_y_continuous(limits = c(0, img_h), expand = c(0, 0)) +
+    coord_fixed() +
+    labs(title = title_str, x = NULL, y = NULL, color = "Description") +
+    theme_void() +
+    theme(plot.title = element_text(hjust = 0.5, size = 12), legend.position = "right") +
+    guides(color = guide_legend(override.aes = list(alpha = 1, size = 2)))
+}
+
+# ── plot_swing_rate_heatmap() ─────────────────────────────────────────────────
+plot_swing_rate_heatmap <- function(player_id, abs_type_filter = NULL, bins = 12, min_pitches = 2) {
+  player_data <- filtered_edge |>
+    filter(batter == player_id, description %in% plate_discipline_desc)
+  if (!is.null(abs_type_filter))
+    player_data <- filter(player_data, abs_type == abs_type_filter)
+  if (nrow(player_data) == 0)
+    stop("No pitches found for batter ", player_id)
+
+  player_px <- player_data |>
+    mutate(
+      plate_z_norm = (plate_z - sz_bot) / (sz_top - sz_bot),
+      px_x         = px_scale_x * plate_x       + px_off_x,
+      px_z         = img_h - (px_scale_z * plate_z_norm + px_off_z),
+      swing        = as.numeric(is_swing)
+    )
+
+  player_name  <- players_dim$full_name[match(player_id, players_dim$player_id)]
+  player_label <- if (length(player_name) == 1 && !is.na(player_name)) player_name else as.character(player_id)
+  title_str    <- paste0("Swing Rate by Location — ", player_label,
+                         if (!is.null(abs_type_filter)) paste0("  [", abs_type_filter, "]") else "  [ABS + Challenge]")
+
+  ggplot(player_px, aes(x = px_x, y = px_z, z = swing)) +
+    annotation_raster(as.raster(batter_img), xmin = 0, xmax = img_w, ymin = 0, ymax = img_h) +
+    stat_summary_2d(
+      fun      = \(z) if (length(z) >= min_pitches) mean(z) else NA_real_,
+      binwidth = c(
+        (zone_px$edge_right - zone_px$edge_left) * 1.5 / bins,
+        (zone_px$edge_top   - zone_px$edge_bot)  * 1.5 / bins
+      ),
+      alpha = 0.78
+    ) +
+    annotate("rect",
+             xmin = zone_px$left, xmax = zone_px$right,
+             ymin = zone_px$bot,  ymax = zone_px$top,
+             fill = NA, color = "black", linewidth = 1.2) +
+    annotate("rect",
+             xmin = zone_px$edge_left, xmax = zone_px$edge_right,
+             ymin = zone_px$edge_bot,  ymax = zone_px$edge_top,
+             fill = NA, color = "grey50", linewidth = 0.5, linetype = "dashed") +
+    # Diverging color scale centered at 50%: blue = rarely swings, red = almost always swings
+    scale_fill_gradient2(
+      name     = "Swing Rate",
+      low      = "royalblue", mid = "white", high = "firebrick",
+      midpoint = 0.5, limits = c(0, 1),
+      labels   = scales::percent_format(accuracy = 1),
+      na.value = NA
+    ) +
+    scale_x_continuous(limits = c(0, img_w), expand = c(0, 0)) +
+    scale_y_continuous(limits = c(0, img_h), expand = c(0, 0)) +
+    coord_fixed() +
+    labs(title = title_str, x = NULL, y = NULL) +
+    theme_void() +
+    theme(plot.title = element_text(hjust = 0.5, size = 12), legend.position = "right")
+}
+```
+
+The following player-specific plots are examples, not standalone evidence. They make the pitch-location logic concrete: for one batter, we can see where borderline pitches were located under each system and whether swing behavior looks different. Because these are single-player snapshots, they shouldn't be generalized. The real conclusion comes from the broader within-player OBP and plate-discipline results across the full sample.
+
+```{r player-670224-edge, fig.height=7.5, fig.cap="Edge pitch locations for player 670224, split by ABS type. Illustrative example only; main inference comes from aggregate within-player comparisons."}
+p1 <- plot_edge_pitches(670224, abs_type_filter = "ABS")
+p2 <- plot_edge_pitches(670224, abs_type_filter = "Challenge")
+plot_grid(p1, p2, ncol = 1)
+```
+
+This plot shows what the raw pitch-location data looks like for one player before anything is aggregated. Individual pitch plots are noisy — each batter only sees a limited number of borderline pitches under each system — so this shouldn't be read as evidence that this particular player changed his behavior. It's an illustration of the measurement approach, not a finding.
+
+The heatmap below translates pitch locations into swing behavior. Deep red indicates more frequent swings; deep blue indicates more frequent takes; white marks the 50% decision boundary.
+
+```{r player-670224-swing, fig.height=7.5, fig.cap="Swing rate heatmap for Kameron Misner (player_id = 670224), split by ABS type. Blue = rarely swings; red = almost always swings. Illustrative example only; main inference comes from aggregate within-player comparisons."}
+p3 <- plot_swing_rate_heatmap(670224, abs_type_filter = "ABS")
+p4 <- plot_swing_rate_heatmap(670224, abs_type_filter = "Challenge")
+plot_grid(p3, p4, ncol = 1)
+```
+
+The heatmap shows why chase rate, take rate, and zone swing rate are useful: they summarize the same swing-by-location behavior shown here, just collapsed into single numbers across all pitches. This plot is not meant to carry the main finding — it's motivation for the plate-discipline metrics in the next section.
+
+The individual pitch visuals above set up the intuition, but they are not the basis for the conclusion. We now look at aggregate within-player comparisons across the full sample, which are much better suited for drawing conclusions. The discipline metrics below ask whether the same batters consistently changed their swing decisions under Full ABS relative to Challenge.
+
+# Swing Discipline
+
+Plate discipline metrics help explain the mechanism behind the OBP result. If Full ABS changes how batters perceive the strike zone, the first evidence should appear in swing decisions rather than necessarily in OBP. A batter might chase less, take more, or become more selective without generating enough additional walks or hits to move overall on-base percentage. We therefore treat chase rate, zone swing rate, and take rate as mechanism measures rather than competing headline outcomes.
+
+Three metrics are computed per batter × ABS-type cell:
+
+- **Chase rate** — fraction of pitches outside the strike zone at which the batter swung:
+$$\text{Chase Rate} = \frac{\text{out-of-zone swings}}{\text{out-of-zone pitches seen}}$$
+
+- **Zone swing %** — fraction of pitches inside the strike zone at which the batter swung:
+$$\text{Zone Swing \%} = \frac{\text{in-zone swings}}{\text{in-zone pitches seen}}$$
+
+- **Take rate** — overall fraction of pitches the batter did not swing at, regardless of location:
+$$\text{Take Rate} = \frac{\text{total pitches} - \text{total swings}}{\text{total pitches}}$$
+
+```{r swing-discipline}
+# chase_rate     = out-of-zone swings / out-of-zone pitches seen
+# zone_swing_pct = in-zone swings     / in-zone pitches seen
+# take_rate      = pitches not swung at / all pitches seen
+swing_discipline <- filtered_edge |>
+  group_by(batter, abs_type) |>
+  summarise(
+    n_pitches      = n(),
+    n_inzone       = sum(in_zone,  na.rm = TRUE),
+    n_outzone      = sum(!in_zone, na.rm = TRUE),
+    swings_inzone  = sum(is_swing &  in_zone,  na.rm = TRUE),
+    swings_outzone = sum(is_swing & !in_zone,  na.rm = TRUE),
+    chase_rate     = if_else(n_outzone > 0, swings_outzone / n_outzone, NA_real_),
+    zone_swing_pct = if_else(n_inzone  > 0, swings_inzone  / n_inzone,  NA_real_),
+    take_rate      = (n_pitches - (swings_inzone + swings_outzone)) / n_pitches,
+    .groups = "drop"
+  ) |>
+  mutate(across(c(chase_rate, zone_swing_pct, take_rate), \(x) round(x, 4)))
+```
+
+```{r swing-discipline-overview}
+swing_discipline |>
+  select(chase_rate, zone_swing_pct, take_rate) |>
+  pivot_longer(everything(), names_to = "metric", values_to = "value") |>
+  group_by(metric) |>
+  summarise(
+    N      = sum(!is.na(value)),
+    Min    = round(min(value,                  na.rm = TRUE), 4),
+    Q1     = round(quantile(value, 0.25,       na.rm = TRUE), 4),
+    Median = round(median(value,               na.rm = TRUE), 4),
+    Mean   = round(mean(value,                 na.rm = TRUE), 4),
+    Q3     = round(quantile(value, 0.75,       na.rm = TRUE), 4),
+    Max    = round(max(value,                  na.rm = TRUE), 4),
+    .groups = "drop"
+  ) |>
+  mutate(metric = recode(metric,
+                         chase_rate     = "Chase Rate",
+                         zone_swing_pct = "Zone Swing %",
+                         take_rate      = "Take Rate")) |>
+  rename(Metric = metric) |>
+  knitr::kable(booktabs = TRUE, caption = "Swing discipline metric summaries")
+```
+
+## Within-Player Differences (ABS − Challenge)
+
+```{r swing-disc-diff}
+# Collapse to the player level by summing raw counts (not averaging rates) to avoid
+# weighting bias from cells with very different pitch totals
+swing_discipline_player <- swing_discipline |>
+  group_by(batter, abs_type) |>
+  summarise(
+    n_pitches      = sum(n_pitches),
+    n_inzone       = sum(n_inzone),
+    n_outzone      = sum(n_outzone),
+    swings_inzone  = sum(swings_inzone),
+    swings_outzone = sum(swings_outzone),
+    .groups = "drop"
+  ) |>
+  mutate(
+    chase_rate     = if_else(n_outzone > 0, swings_outzone / n_outzone, NA_real_),
+    zone_swing_pct = if_else(n_inzone  > 0, swings_inzone  / n_inzone,  NA_real_),
+    take_rate      = (n_pitches - (swings_inzone + swings_outzone)) / n_pitches
+  )
+
+# Pivot wide then subtract ABS − Challenge to get per-player treatment differences
+swing_discipline_diff <- swing_discipline_player |>
+  select(batter, abs_type, chase_rate, zone_swing_pct, take_rate) |>
+  pivot_wider(names_from  = abs_type,
+              values_from = c(chase_rate, zone_swing_pct, take_rate)) |>
+  filter(
+    !is.na(chase_rate_ABS),     !is.na(chase_rate_Challenge),
+    !is.na(zone_swing_pct_ABS), !is.na(zone_swing_pct_Challenge),
+    !is.na(take_rate_ABS),      !is.na(take_rate_Challenge)
+  ) |>
+  mutate(
+    chase_diff      = round(chase_rate_ABS     - chase_rate_Challenge,     4),
+    zone_swing_diff = round(zone_swing_pct_ABS - zone_swing_pct_Challenge, 4),
+    take_diff       = round(take_rate_ABS      - take_rate_Challenge,      4)
+  ) |>
+  select(batter, chase_diff, zone_swing_diff, take_diff) |>
+  arrange(desc(abs(chase_diff)))
+```
+
+```{r swing-disc-diff-histograms, fig.height=9, fig.cap="Distributions of per-player swing discipline differences (ABS minus Challenge). Shaded band = 95% CI on the mean; red dashed = mean; orange dotted = median; solid black = 0."}
+diff_labels <- c(
+  chase_diff      = "Chase Rate Diff",
+  zone_swing_diff = "Zone Swing % Diff",
+  take_diff       = "Take Rate Diff"
+)
+
+diff_long <- swing_discipline_diff |>
+  pivot_longer(cols = c(chase_diff, zone_swing_diff, take_diff),
+               names_to = "metric", values_to = "diff") |>
+  mutate(metric = recode(metric, !!!diff_labels))
+
+# 95% CI on the mean: mean ± t*(0.975, df=n-1) × (sd/√n)
+diff_refs <- diff_long |>
+  group_by(metric) |>
+  summarise(
+    n      = sum(!is.na(diff)),
+    mean   = mean(diff,   na.rm = TRUE),
+    median = median(diff, na.rm = TRUE),
+    sd     = sd(diff,     na.rm = TRUE),
+    iqr    = IQR(diff,    na.rm = TRUE),
+    min    = min(diff,    na.rm = TRUE),
+    max    = max(diff,    na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    se     = sd / sqrt(n),
+    t_crit = qt(0.975, df = n - 1),
+    ci_lo  = mean - t_crit * se,
+    ci_hi  = mean + t_crit * se,
+    label  = paste0(
+      "n:            ", n,                             "\n",
+      "Mean:      ", sprintf("%+.4f", mean),           "\n",
+      "95% CI:   [", sprintf("%+.4f", ci_lo), ", ",
+                     sprintf("%+.4f", ci_hi),  "]",   "\n",
+      "Median:  ", sprintf("%+.4f", median),           "\n",
+      "SD:          ", sprintf("%.4f",  sd),           "\n",
+      "IQR:        ", sprintf("%.4f",  iqr),           "\n",
+      "Min:         ", sprintf("%+.4f", min),          "\n",
+      "Max:        ", sprintf("%+.4f", max)
+    )
+  )
+
+diff_long |>
+  ggplot(aes(x = diff)) +
+  geom_rect(data = diff_refs,
+            aes(xmin = ci_lo, xmax = ci_hi, ymin = -Inf, ymax = Inf),
+            fill = "tomato", alpha = 0.15, inherit.aes = FALSE) +
+  geom_density(fill = "steelblue", color = "steelblue", alpha = 0.4) +
+  geom_vline(xintercept = 0, linetype = "solid", color = "black", linewidth = 0.6) +
+  geom_vline(data = diff_refs, aes(xintercept = mean,   color = "Mean"),
+             linewidth = 0.8, linetype = "dashed") +
+  geom_vline(data = diff_refs, aes(xintercept = median, color = "Median"),
+             linewidth = 0.8, linetype = "dotted") +
+  geom_text(data = diff_refs, aes(x = Inf, y = Inf, label = label),
+            hjust = 1.05, vjust = 1.1, size = 3.5, family = "mono", inherit.aes = FALSE) +
+  scale_color_manual(name = "", values = c(Mean = "red", Median = "orange")) +
+  coord_cartesian(xlim = c(-0.33, 0.33)) +
+  facet_wrap(~ metric, scales = "free_y", ncol = 1) +
+  labs(
+    title = "Distribution of Swing Discipline Differences by Player (ABS − Challenge)",
+    x     = "Difference (ABS − Challenge)",
+    y     = "Density"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom", plot.title = element_text(hjust = 0.5))
+```
+
+All three metrics show small but consistent directional shifts under Full ABS. The **chase rate** difference is negative (fewer out-of-zone swings under Full ABS); the **take rate** difference is positive (more pitches taken); the **zone swing %** difference is also negative. These directions are consistent with marginally more selective behavior under Full ABS. As shown by the shaded CI bands in the plots, all three confidence intervals exclude zero — the shifts are statistically detectable. However, the effects are on the order of one to two percentage points, which is not large enough to produce a meaningful OBP impact. Statistical detectability does not imply practical importance here.
+
+**Managerial takeaway:** Full ABS appears to change batter approach slightly, but not enough to materially change offensive performance. Players chase fewer pitches outside the zone, take more pitches overall, and swing less often at pitches in the strike zone under Full ABS. That pattern suggests batters may become a bit more selective when they trust the automated zone. However, the differences are small — roughly around one percentage point — so this is not a performance-changing effect. For MLB, the implication is that Full ABS may subtly alter plate discipline, but it should not be expected to materially improve or suppress hitter outcomes.
+
+# Pitch Mix by Treatment
+
+As a further check, we look at whether the overall mix of pitches batters saw — balls, strikes, and balls put in play — differed between Full ABS and Challenge games. If one system was producing more called strikes or balls at the league level, we would see it in the raw pitch mix before any batter behavioral changes. If the mix looks the same, it rules out the possibility that batters were facing a different pitch environment under each system — meaning any OBP effect would have to come from how batters responded, not what they were thrown.
+
+```{r pitch-mix}
+# Statcast `type` codes: B = ball, S = strike (called or swinging), X = in play.
+pitch_mix_by_treatment <- filtered |>
+  group_by(abs_type, batter) |>
+  summarise(
+    total_pitches = n(),
+    ball_pct      = round(mean(type == "B", na.rm = TRUE) * 100, 2),
+    strike_pct    = round(mean(type == "S", na.rm = TRUE) * 100, 2),
+    in_play_pct   = round(mean(type == "X", na.rm = TRUE) * 100, 2),
+    .groups = "drop"
+  )
+```
+
+```{r pitch-mix-ridgeline, fig.cap="Distribution of pitch-type percentages per batter, stratified by ABS type. Median line shown through each ridge."}
+pitch_mix_by_treatment |>
+  select(batter, abs_type, ball_pct, strike_pct, in_play_pct) |>
+  pivot_longer(cols = c(ball_pct, strike_pct, in_play_pct),
+               names_to = "metric", values_to = "pct") |>
+  mutate(metric = recode(metric,
+                         ball_pct    = "Ball %",
+                         strike_pct  = "Strike %",
+                         in_play_pct = "In Play %")) |>
+  ggplot(aes(x = pct, y = metric, fill = abs_type)) +
+  geom_density_ridges(alpha = 0.5, scale = 1, rel_min_height = 0.01,
+                      quantile_lines = TRUE, quantiles = 2) +
+  scale_fill_manual(values = c(ABS = "steelblue", Challenge = "tomato")) +
+  scale_y_discrete(expand = expansion(mult = c(0.05, 0.4))) +
+  coord_cartesian(clip = "off") +
+  labs(title = "Distribution of Pitch Mix % by Treatment",
+       x = "Percentage", y = NULL, fill = "ABS Type") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom", plot.title = element_text(hjust = 0.5))
+```
+
+The ABS and Challenge ridges overlap almost completely for every pitch type, consistent with small OBP differences between systems.
+
+```{r pitch-mix-diff-ridgeline, fig.cap="Per-batter pitch mix differences (ABS minus Challenge). Dashed line at 0."}
+# Pivot wide then subtract to get the per-batter treatment difference in pitch mix.
+pitch_mix_diff <- pitch_mix_by_treatment |>
+  select(batter, abs_type, ball_pct, strike_pct, in_play_pct) |>
+  pivot_wider(names_from  = abs_type,
+              values_from = c(ball_pct, strike_pct, in_play_pct)) |>
+  filter(!is.na(ball_pct_ABS),    !is.na(ball_pct_Challenge),
+         !is.na(strike_pct_ABS),  !is.na(strike_pct_Challenge),
+         !is.na(in_play_pct_ABS), !is.na(in_play_pct_Challenge)) |>
+  mutate(
+    ball_diff    = ball_pct_ABS    - ball_pct_Challenge,
+    strike_diff  = strike_pct_ABS  - strike_pct_Challenge,
+    in_play_diff = in_play_pct_ABS - in_play_pct_Challenge
+  ) |>
+  select(batter, ball_diff, strike_diff, in_play_diff)
+
+pitch_mix_diff |>
+  pivot_longer(cols = c(ball_diff, strike_diff, in_play_diff),
+               names_to = "metric", values_to = "diff") |>
+  mutate(metric = recode(metric,
+                         ball_diff    = "Ball %",
+                         strike_diff  = "Strike %",
+                         in_play_diff = "In Play %")) |>
+  ggplot(aes(x = diff, y = metric, fill = metric)) +
+  geom_density_ridges(alpha = 0.5, scale = 1, rel_min_height = 0.01,
+                      quantile_lines = TRUE, quantiles = 2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  scale_fill_manual(values = c("Ball %" = "steelblue",
+                               "Strike %" = "tomato",
+                               "In Play %" = "seagreen")) +
+  scale_y_discrete(expand = expansion(mult = c(0.05, 0.4))) +
+  coord_cartesian(clip = "off") +
+  labs(title = "Distribution of Pitch Mix Difference by Batter (ABS - Challenge)",
+       x = "Difference (pp)", y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5))
+```
+
+At the individual level, pitch mix differences between systems are centered tightly on zero. Very few batters show large directional shifts in any category, and the distributions are symmetric. This confirms that batters were not facing meaningfully different pitch environments under each system. The small OBP difference we found in the main analysis therefore can't be explained by differences in what pitchers were throwing — if it's a real effect, it would have to come from how batters changed their approach, which is consistent with the modest plate-discipline shifts in the previous section.
+
+# Conclusions
+
+Our central question was whether Full ABS versus the Challenge System materially changed batter on-base percentage in AAA baseball during the 2023–2024 pilot. We looked at this several ways — aggregate OBP comparisons, within-player OBP differences, month-by-month breakdowns, and different minimum plate appearance thresholds — and consistently found that OBP differences between systems were **small, inconsistent depending on how we filtered the sample, and not practically meaningful**.
+
+From a management perspective: MLB should not expect either ABS format to materially change hitter performance. The main result shows a small positive ABS-minus-Challenge OBP difference, but that number flips negative when we use a stricter 50-PA filter. Because the result changes direction under a reasonable alternative cutoff, we don't treat the positive estimate as reliable evidence that Full ABS improves OBP.
+
+The key findings are:
+
+- **OBP distributions under both systems were nearly identical** at the aggregate level, with median values near 0.33–0.35 in both conditions.
+- **Within-player OBP differences were small and fragile.** The main result shows a slightly positive mean (Full ABS above Challenge), but the number is sensitive to the PA minimum and shouldn't be taken as a reliable finding.
+- **The OBP result doesn't hold up under a stricter filter.** The 50-PA sample reverses sign compared to the 30-PA main result, which tells us the finding depends heavily on how we constructed the sample.
+- **Plate discipline metrics show statistically detectable but practically small shifts**: under Full ABS, batters chased fewer pitches out of the zone, took more pitches overall, and swung less at pitches in the zone — consistent with slightly more selective behavior. The 95% confidence intervals for all three metrics exclude zero, but the differences are around one to two percentage points, which is too small to produce meaningful OBP gains.
+
+Taken together, the data suggests that the type of ball-strike system used in the AAA pilot did not produce any meaningful, consistent effect on batter OBP. The plate-discipline shifts are real and statistically detectable, but they're too small to translate into run-production differences at the team level.
+
+\begin{quote}
+\textbf{Managerial Bottom Line:} The evidence does not support a strong claim that Full ABS improves or worsens hitter performance relative to the Challenge System. The OBP differences are small and not robust under stricter sample thresholds. The discipline differences are directionally consistent with more selective batting under Full ABS, but they are too small to move the offensive baseline. MLB should therefore make the ABS design choice based on operational and entertainment criteria, not expected changes in batter production.
+\end{quote}
+
+Recommended decision rule. If MLB's priority is consistency, call accuracy, and standardizing the strike zone across parks, Full ABS is the cleaner design. If MLB's priority is preserving umpire involvement, creating strategic moments, and maintaining a more traditional game feel, the Challenge System is the cleaner design. Our analysis suggests either choice is defensible from a hitter-performance standpoint because neither system produces a robust, practically meaningful OBP difference in this AAA sample.
+
+# Limitations
+
+There are several limitations to what we can conclude from this analysis.
+
+**Non-random ABS assignment.** ABS type was assigned by day of week — not randomly. The assignment was outside the control of any player or team, but weekday games may still differ from weekend games in ways that matter: attendance, travel fatigue, pitcher rotation, rest, and roster decisions. We can't fully rule out that weekday vs. weekend differences — rather than the ABS system itself — are driving some of what we see.
+
+**No challenge outcome data.** Under the Challenge System, teams can dispute a human umpire's call by appealing to Hawk-Eye. The Statcast data doesn't tell us whether a pitch was called and accepted or challenged and overturned. That means Challenge System games are actually a mix of human-called and machine-corrected calls.
+
+**Player composition drift.** AAA rosters change constantly due to promotions, demotions, and injuries. A batter who primarily played on weekdays may be systematically different from one who played mostly on weekends for reasons tied to team strategy. Our within-player design helps with this but doesn't eliminate it entirely.
+
+**AAA ≠ MLB.** The behavioral responses and skill levels at the AAA level may not generalize to how MLB-caliber hitters would respond to the same system.
+
+**Limited offensive outcome scope.** OBP is a comprehensive measure of a batter's ability to avoid making outs, but it does not capture every dimension of offensive value. Slugging percentage, isolated power, quality of contact, and run expectancy could respond differently from OBP. Future analysis could examine whether ABS affects batted-ball quality or power outcomes even if reaching base remains unchanged.
+
+\newpage
+
+# Appendix: Descriptive Statistics
+
+## Pitch-Level Breakdowns
+
+```{r pitch-type}
+# Count pitches by Statcast pitch_name and compute each type's share of total pitches
+filtered |>
+  count(pitch_name, sort = TRUE) |>
+  mutate(pct = round(n / sum(n) * 100, 1)) |>
+  rename(`Pitch Name` = pitch_name, Count = n, `Share (%)` = pct) |>
+  knitr::kable(booktabs = TRUE, caption = "Pitch type frequency and share")
+```
+
+```{r event-breakdown}
+# The `events` column is only populated on the final pitch of each plate appearance
+filtered |>
+  filter(!is.na(events), events != "") |>
+  count(events, sort = TRUE) |>
+  rename(Event = events, Count = n) |>
+  knitr::kable(booktabs = TRUE, caption = "Plate appearance outcome breakdown")
+```
+
+## Batter Counting Statistics: Distributions
+
+```{r counting-stat-histograms, fig.height=6, fig.cap="Distribution of batter counting statistics. Red dashed = mean; orange dotted = median."}
+metric_labels <- c(
+  games_played = "Games Played",
+  hits         = "Hits",
+  walks        = "Walks",
+  hbp          = "Hit By Pitch",
+  at_bats      = "At Bats",
+  sac_flies    = "Sacrifice Flies"
+)
+
+hist_long <- event_summary |>
+  select(games_played, hits, walks, hbp, at_bats, sac_flies) |>
+  pivot_longer(everything(), names_to = "metric", values_to = "value") |>
+  mutate(metric = recode(metric, !!!metric_labels))
+
+hist_refs <- hist_long |>
+  group_by(metric) |>
+  summarise(mean = mean(value), median = median(value))
+
+sparse_metrics <- c("Hit By Pitch", "Sacrifice Flies")
+
+hist_long |>
+  ggplot(aes(x = value)) +
+  geom_histogram(data = ~ filter(.x, !metric %in% sparse_metrics),
+                 bins = 30, fill = "steelblue", color = "white") +
+  geom_histogram(data = ~ filter(.x, metric %in% sparse_metrics),
+                 binwidth = 1, fill = "steelblue", color = "white") +
+  geom_vline(data = hist_refs, aes(xintercept = mean,   color = "Mean"),
+             linewidth = 0.8, linetype = "dashed") +
+  geom_vline(data = hist_refs, aes(xintercept = median, color = "Median"),
+             linewidth = 0.8, linetype = "dotted") +
+  scale_color_manual(name = "", values = c(Mean = "red", Median = "orange")) +
+  facet_wrap(~ metric, scales = "free", ncol = 3) +
+  labs(title = "Distribution of Batter Count Stats", x = "Count", y = "Number of Batters") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom", plot.title = element_text(hjust = 0.5))
+```
