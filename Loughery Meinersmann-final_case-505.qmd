@@ -1,0 +1,150 @@
+---
+title: "Shelf Life: Can Electronic Shelf Labels Pay Off?"
+subtitle: "AIML 451 - Final Case Analysis - Case 505"
+author: "Patrick Loughery and John Meinersmann"
+date: today
+format:
+  pdf:
+    toc: true
+    number-sections: true
+    fig-pos: "H"
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Setup
+
+```{r}
+#| label: setup
+library(tidyverse)
+```
+
+# Data
+
+```{r}
+#| label: load-data
+hfc_tib <- read_rds(str_c(
+  "https://www.dropbox.com/scl/fi/kospnc09qscm43inp0jgk/",
+  "hfc.rds?rlkey=a14kkpiha47hhjuyvn4ffswnj&dl=1"))
+```
+
+```{r}
+#| label: clean-data
+hfc_tib <- hfc_tib %>%
+  arrange(store, product, date) %>%
+  mutate(gross_profit = (price_retail - price_wholesale) * sales,
+         price_id = consecutive_id(price_retail), .by = c(store, product)) %>%
+  mutate(days_since_price_change = row_number(date) - 1,
+         days_until_price_change = row_number(-as.integer(date)),
+         .by = c(store, product, price_id)) %>%
+  filter(price_id > 1)
+
+horizon_length <- 90
+post_change_mean_profit <- hfc_tib %>%
+  filter(days_since_price_change <= horizon_length,
+         n() >= horizon_length, .by = c(store, product, price_id)) %>%
+  summarise(mean_profit = mean(gross_profit), .by = days_since_price_change)
+```
+
+# Period 1: Baseline (Current System)
+
+*Menu cost = $0.40. What is HFC's optimal price duration and profit-per-day today?*
+
+```{r}
+#| label: period-1
+menu_cost <- 0.40
+net_ppd <- numeric(90)
+
+for (d in 1:90) {
+  profit_sum <- post_change_mean_profit %>%
+    filter(days_since_price_change < d) %>%
+    pull(mean_profit) %>%
+    sum()
+
+  net_ppd[d] <- (profit_sum - menu_cost) / d
+}
+
+optimal_d <- which.max(net_ppd)
+cat("Optimal duration:", optimal_d, "days\n")
+cat("Net profit per day:", round(net_ppd[optimal_d], 4), "\n")
+```
+
+# Period 2: ESL World
+
+*Menu cost = $0.05. How does the optimal price duration and profit-per-day change?*
+
+```{r}
+#| label: period-2
+menu_cost_esl <- 0.05
+net_ppd_esl <- numeric(90)
+
+for (d in 1:90) {
+  profit_sum <- post_change_mean_profit %>%
+    filter(days_since_price_change < d) %>%
+    pull(mean_profit) %>%
+    sum()
+
+  net_ppd_esl[d] <- (profit_sum - menu_cost_esl) / d
+}
+
+optimal_d_esl <- which.max(net_ppd_esl)
+cat("ESL optimal duration:", optimal_d_esl, "days\n")
+cat("ESL net profit per day:", round(net_ppd_esl[optimal_d_esl], 4), "\n")
+cat("Duration change:", optimal_d_esl - optimal_d, "days\n")
+cat("Profit-per-day change:", round(net_ppd_esl[optimal_d_esl] - net_ppd[optimal_d], 4), "\n")
+```
+
+# Period 3: NPV and Recommendation
+
+*Is the switch to ESLs worth it? Compute the NPV per product and stress-test the result.*
+
+```{r}
+#| label: period-3-npv
+r <- 0.12
+skus_per_store <- 50000
+
+# Daily profit-per-day gain from switching to ESL
+daily_gain_per_sku <- net_ppd_esl[optimal_d_esl] - net_ppd[optimal_d]
+
+# Annualize, then take perpetuity value
+annual_gain_per_sku <- daily_gain_per_sku * 365
+pv_per_sku <- annual_gain_per_sku / r
+pv_per_store <- pv_per_sku * skus_per_store
+
+cat("Daily profit gain per SKU:  $", round(daily_gain_per_sku, 4), "\n")
+cat("Annual profit gain per SKU: $", round(annual_gain_per_sku, 2), "\n")
+cat("PV per SKU (break-even install cost): $", round(pv_per_sku, 2), "\n")
+cat("PV per store:                         $", format(round(pv_per_store, 0), big.mark = ","), "\n")
+
+# Stress test: vary discount rate from 8% to 16%
+stress <- tibble(
+  rate = seq(0.08, 0.16, by = 0.01),
+  pv_per_sku = (annual_gain_per_sku) / rate,
+  pv_per_store = pv_per_sku * skus_per_store
+)
+print(stress)
+
+# Conservative stress test: profit gain overstated by 5x
+install_cost_per_sku <- 12.00
+conservative_annual_gain <- annual_gain_per_sku / 5
+conservative_pv_per_sku <- conservative_annual_gain / r
+conservative_npv_per_sku <- conservative_pv_per_sku - install_cost_per_sku
+
+cat("\n--- Conservative Case (gain / 5, install = $12/SKU) ---\n")
+cat("Annual gain per SKU (conservative): $", round(conservative_annual_gain, 2), "\n")
+cat("PV per SKU:                         $", round(conservative_pv_per_sku, 2), "\n")
+cat("NPV per SKU after $12 install:      $", round(conservative_npv_per_sku, 2), "\n")
+cat("NPV per store:", format(round(conservative_npv_per_sku * skus_per_store, 0), big.mark = ","), "\n")
+```
+
+# Recommendation
+
+HFC should install electronic shelf labels. The case for doing so does not rest primarily on labor savings — it rests on the value of repricing more frequently.
+
+Under the current system, a \$0.40 menu cost pushes HFC toward longer pricing cycles. Every extra day a stale price rides, gross profit decays. ESLs drop that cost to \$0.05, shifting the optimal cycle shorter and keeping prices closer to where they should be. That repricing benefit — measured directly from HFC's own profit decay curve — is worth approximately \$59.80 per SKU at a 12% discount rate, or roughly \$3.0 million per store.
+
+The stress test confirms the base case is compelling. At one-fifth the estimated demand lift and a \$12 per label install cost, the project is essentially breakeven — the downside scenario is not losing money, it is not gaining it. The math does not produce a meaningful loss until the benefit estimate is wrong by roughly 5x. That is not a realistic downside case; it is the boundary condition of the model.
+
+The error in a purely cost-focused analysis is measuring only what ESLs save on labor. The larger value is what they recover in margin. Ignacio should authorize the install.

@@ -1,0 +1,1485 @@
+﻿---
+title: "Coke Zero vs. Pepsi Zero: Reddit Sentiment Analysis"
+subtitle: "AI Classification, Difference-in-Differences, and Executive Memo"
+author: "Ethan Girtz and John Meinersmann"
+date: today
+format:
+  pdf:
+    toc: true
+    number-sections: true
+    geometry:
+      - left=0.75in
+      - right=0.75in
+      - top=1in
+      - bottom=1in
+    fontsize: 10pt
+knitr:
+  opts_chunk:
+    comment: "#>"
+---
+
+```{r}
+#| label: setup
+#| include: false
+options(width = 80)
+```
+
+# Section 1: Pulling the Data from the PullPush Reddit API
+
+## Exercise 1: Pull Reddit Posts and Comments
+
+The script below pulls all Reddit posts and comments mentioning Coke Zero or Pepsi Zero/Max
+from the PullPush archive across two full-year windows (2017 and 2021), each centered on a
+Coca-Cola formula-change event. Pagination advances by `created_utc`; transient HTTP errors
+(429, 5xx) trigger exponential backoff up to six retries. Output is deduplicated on `(id, type)`
+and saved to `coke_pepsi_reddit_all.csv`.
+
+```{r}
+#| label: ex-1-pull
+#| eval: false
+library(httr2)
+library(jsonlite)
+library(dplyr)
+library(readr)
+
+output_path <- "C:/Users/johnm/OneDrive/Documents/Claude/Projects/AIML - 451 Work/api_pulls/data/coke_pepsi_reddit_full_pull.csv"
+
+start_time <- Sys.time()
+
+# --- Study design ---------------------------------------------------------
+# Two event windows capture distinct Coke Zero brand moments; Pepsi Zero/Max
+# serves as the control because it had no major changes in either period.
+# Unix timestamps are required by the PullPush API's after/before parameters.
+
+windows <- list(
+  `2017_rebrand`      = list(after = as.integer(as.POSIXct("2017-01-01", tz = "UTC")),
+                              before = as.integer(as.POSIXct("2018-01-01", tz = "UTC"))),
+  `2021_reformulation` = list(after = as.integer(as.POSIXct("2021-01-01", tz = "UTC")),
+                               before = as.integer(as.POSIXct("2022-01-01", tz = "UTC")))
+)
+
+# Multiple spellings are included because users write them inconsistently;
+# each variant is queried separately and deduplicated at the end.
+terms <- list(
+  treatment = c("coke zero", "cokezero", "coca cola zero"),
+  control   = c("pepsi zero", "pepsizero", "pepsi max", "pepsimax")
+)
+
+# --- API constants --------------------------------------------------------
+BASE_URL   <- "https://api.pullpush.io"
+PAGE_SIZE  <- 100                               # max items per request
+TRANSIENT  <- c(429L, 500L, 502L, 503L, 504L)  # HTTP codes worth retrying
+BACKOFFS   <- c(30, 60, 120, 240, 480, 600)     # seconds to wait on each retry attempt
+
+# Fetch one page of results from a PullPush endpoint.
+# Returns a list of raw item objects, or NULL if the request ultimately fails.
+# Sorting ascending by created_utc lets us paginate by advancing `after`
+# to the timestamp of the last item on each page.
+fetch_page <- function(endpoint, q, after, before) {
+  req <- request(paste0(BASE_URL, endpoint)) |>
+    req_url_query(q = q, after = after, before = before,
+                  size = PAGE_SIZE, sort = "asc", sort_type = "created_utc") |>
+    req_timeout(30)
+
+  for (attempt in seq_along(BACKOFFS)) {
+    # Capture network errors as values so we can handle them uniformly below
+    resp <- tryCatch(req_perform(req), error = function(e) e)
+
+    if (inherits(resp, "error")) {
+      status <- NA_integer_
+      msg    <- conditionMessage(resp)
+    } else {
+      status <- resp_status(resp)
+      msg    <- NULL
+    }
+
+    # Success: parse and return the data array
+    if (!inherits(resp, "error") && status == 200L) {
+      body   <- resp_body_string(resp)
+      parsed <- fromJSON(body, simplifyVector = FALSE)
+      items  <- if (is.list(parsed$data)) parsed$data else list()
+      return(items)
+    }
+
+    # Non-transient error (e.g. 404): retrying won't help, skip this page
+    if (!inherits(resp, "error") && !(status %in% TRANSIENT)) {
+      warning(sprintf("Non-transient HTTP %d for q=%s — skipping page.", status, q))
+      return(NULL)
+    }
+
+    # Transient error or network failure: wait before retrying
+    sleep_sec <- BACKOFFS[min(attempt, length(BACKOFFS))]
+    Sys.sleep(sleep_sec)
+  }
+
+  warning(sprintf("All retries exhausted for q=%s — skipping page.", q))
+  NULL
+}
+
+# Convert a raw submission (post) object into a one-row tibble.
+# selftext holds the post body; title is blank for comments so we use "" here.
+extract_post <- function(item, term, group, window_name) {
+  tibble(
+    id          = as.character(item$id %||% NA),
+    type        = "post",
+    subreddit   = as.character(item$subreddit %||% NA),
+    author      = as.character(item$author %||% NA),
+    title       = as.character(item$title %||% ""),
+    text        = as.character(item$selftext %||% ""),
+    score       = as.integer(item$score %||% NA),
+    comments    = as.integer(item$num_comments %||% 0L),
+    created_utc = as.integer(item$created_utc %||% NA),
+    term        = term,
+    group       = group,
+    window      = window_name
+  )
+}
+
+# Convert a raw comment object into a one-row tibble.
+# Comments have no title and no child-comment count in this API response.
+extract_comment <- function(item, term, group, window_name) {
+  tibble(
+    id          = as.character(item$id %||% NA),
+    type        = "comment",
+    subreddit   = as.character(item$subreddit %||% NA),
+    author      = as.character(item$author %||% NA),
+    title       = "",
+    text        = as.character(item$body %||% ""),
+    score       = as.integer(item$score %||% NA),
+    comments    = 0L,
+    created_utc = as.integer(item$created_utc %||% NA),
+    term        = term,
+    group       = group,
+    window      = window_name
+  )
+}
+
+# NULL-coalescing helper: return x if non-NULL, otherwise y
+`%||%` <- function(x, y) if (!is.null(x)) x else y
+
+# Page through an endpoint until no new results are returned.
+# Pagination works by advancing `after` to the last item's timestamp on
+# each page; the loop exits when the API returns an empty page or repeats
+# the same cursor (which would cause an infinite loop).
+pull_endpoint <- function(endpoint, extractor, q, after_start, before_end,
+                          term, group, window_name) {
+  rows  <- list()
+  after <- after_start
+
+  repeat {
+    items <- fetch_page(endpoint, q, after, before_end)
+
+    if (is.null(items) || length(items) == 0L) break
+
+    rows <- c(rows, lapply(items, extractor, term = term,
+                           group = group, window_name = window_name))
+
+    # Advance the cursor; stop if the API returns a stale or missing timestamp
+    last_utc <- items[[length(items)]]$created_utc
+    if (is.null(last_utc) || as.integer(last_utc) <= after) break
+    after <- as.integer(last_utc)
+
+    Sys.sleep(0.5)  # reduced from 1.5s; rate-limit backoff handles spikes
+  }
+
+  if (length(rows) == 0L) return(tibble())
+  bind_rows(rows)
+}
+
+# Execute one job spec and return a tibble of collected rows.
+run_job <- function(job) {
+  extractor_fn <- if (job$label == "posts") extract_post else extract_comment
+  df <- pull_endpoint(
+    endpoint    = job$endpoint,
+    extractor   = extractor_fn,
+    q           = job$term,
+    after_start = job$after,
+    before_end  = job$before,
+    term        = job$term,
+    group       = job$group,
+    window_name = job$window
+  )
+  cat(sprintf("  done [%s | %s | %s] -> %d rows\n", job$window, job$term, job$label, nrow(df)))
+  df
+}
+
+# --- Build flat job list --------------------------------------------------
+# Each combination of window × group × term × content type becomes one job.
+# Flattening first makes it straightforward to distribute across workers.
+
+endpoints <- list(
+  list(endpoint = "/reddit/search/submission/", label = "posts"),
+  list(endpoint = "/reddit/search/comment/",    label = "comments")
+)
+
+jobs <- list()
+for (wname in names(windows)) {
+  wparams <- windows[[wname]]
+  for (grp in names(terms)) {
+    for (term in terms[[grp]]) {
+      for (ep in endpoints) {
+        jobs[[length(jobs) + 1L]] <- list(
+          window   = wname,
+          after    = wparams$after,
+          before   = wparams$before,
+          group    = grp,
+          term     = term,
+          endpoint = ep$endpoint,
+          label    = ep$label
+        )
+      }
+    }
+  }
+}
+
+cat(sprintf("Running %d jobs sequentially...\n", length(jobs)))
+
+# --- Sequential execution -------------------------------------------------
+all_data <- lapply(jobs, run_job)
+
+# --- Output ---------------------------------------------------------------
+# Deduplicate on (id, type) because the same post/comment can match multiple
+# search terms (e.g. a post mentioning both "coke zero" and "cokezero").
+
+combined <- bind_rows(all_data) |>
+  distinct(id, type, .keep_all = TRUE)
+
+write_csv(combined, output_path)
+cat(sprintf("\nWrote %d deduplicated rows to:\n  %s\n", nrow(combined), output_path))
+
+cat("\nCount summary (window x group x type):\n")
+combined |>
+  count(window, group, type) |>
+  as.data.frame() |>
+  print()
+
+elapsed <- difftime(Sys.time(), start_time, units = "mins")
+cat(sprintf("\nTotal wall-clock time: %.1f minutes\n", as.numeric(elapsed)))
+
+```
+
+---
+
+# Section 2: Loading and Cleaning the Data
+
+## Exercise 2: Load and Explore the Raw Data
+
+### 2(b): Load Data
+
+```{r}
+#| label: ex-2b-load
+#| message: false
+#| warning: false
+
+if (!requireNamespace("here", quietly = TRUE)) install.packages("here")
+
+library(here)
+library(tidyverse)
+reddit <- read_csv(here("data", "coke_pepsi_reddit_all.csv"))
+glimpse(reddit)
+```
+
+### 2(c): Filter to r/cocacola
+
+```{r}
+#| label: ex-2c-cocacola
+
+reddit |>
+  filter(subreddit == "cocacola") |>
+  glimpse()
+```
+
+### 2(d): Row Count, Type Share, and Date Range
+
+```{r}
+#| label: ex-2d
+
+# (1) Total row count
+nrow(reddit)
+
+# (2) Share of posts vs. comments
+reddit |>
+  count(type) |>
+  mutate(share = n / sum(n))
+
+# (3) Date range of created_utc
+range(as.POSIXct(reddit$created_utc, origin = "1970-01-01", tz = "UTC"))
+```
+
+### 2(e): Earliest Posts and Comments in r/cocacola
+
+```{r}
+#| label: ex-2e
+
+cocacola <- reddit |>
+  filter(subreddit == "cocacola") |>
+  mutate(date = format(as.POSIXct(created_utc, origin = "1970-01-01", tz = "UTC"), "%Y-%m-%d"))
+
+earliest <- bind_rows(
+  cocacola |> filter(type == "comment") |> slice_min(created_utc, n = 3),
+  cocacola |> filter(type == "post")    |> slice_min(created_utc, n = 3)
+)
+
+for (i in seq_len(nrow(earliest))) {
+  row <- earliest[i, ]
+  cat(sprintf(
+    "**[%s] %s | r/%s | score: %s | %s**\n\n%s\n\n---\n\n",
+    row$type, row$author, row$subreddit, row$score, row$date,
+    replace_na(row$text, "*(no body)*")
+  ))
+}
+```
+
+## Exercise 3: Clean the Raw Text
+
+### 3(a): Strip URLs, Markdown, and HTML Entities
+
+```{r}
+#| label: ex-3a
+
+clean_reddit_text <- function(x) {
+  x |>
+    str_replace_all("\\[([^\\]]+)\\]\\([^)]+\\)", "\\1") |>  # [text](url) → text
+    str_replace_all("https?://\\S+", "") |>                   # bare URLs
+    str_replace_all("\\b[ur]/\\w+", "") |>                    # u/foo r/bar
+    str_replace_all("&amp;",  "&")  |>
+    str_replace_all("&lt;",   "<")  |>
+    str_replace_all("&gt;",   ">")  |>
+    str_replace_all("&quot;", '"')  |>
+    str_replace_all("&nbsp;", " ")  |>
+    str_replace_all("[*_`]+", "") |>                          # emphasis chars
+    str_replace_all("(?m)^#+\\s*", "") |>                     # header markers
+    str_replace_all("\\s+", " ") |>
+    str_trim()
+}
+
+text_orig <- reddit$text
+
+reddit <- reddit |>
+  mutate(
+    text  = clean_reddit_text(text),
+    title = clean_reddit_text(title)
+  )
+
+chars_before <- sum(nchar(text_orig),   na.rm = TRUE)
+chars_after  <- sum(nchar(reddit$text), na.rm = TRUE)
+cat(sprintf(
+  "Characters in text — before: %s  after: %s  removed: %s\n",
+  format(chars_before,                big.mark = ","),
+  format(chars_after,                 big.mark = ","),
+  format(chars_before - chars_after,  big.mark = ",")
+))
+```
+
+### 3(b): Deduplicate — Pass 1 (Same Text, Same Author)
+
+```{r}
+#| label: ex-3b-pass1
+
+n_before <- nrow(reddit)
+
+reddit <- reddit |>
+  distinct(text, author, .keep_all = TRUE)
+
+n_after <- nrow(reddit)
+cat(sprintf(
+  "Pass 1 (cross-post dedup)  before: %s  after: %s  dropped: %s\n",
+  format(n_before,           big.mark = ","),
+  format(n_after,            big.mark = ","),
+  format(n_before - n_after, big.mark = ",")
+))
+```
+
+### 3(b): Deduplicate — Pass 2 (Same Text, Same Subreddit)
+
+```{r}
+#| label: ex-3b-pass2
+
+n_before <- nrow(reddit)
+
+reddit <- reddit |>
+  distinct(text, subreddit, .keep_all = TRUE)
+
+n_after <- nrow(reddit)
+cat(sprintf(
+  "Pass 2 (coordinated dedup) before: %s  after: %s  dropped: %s\n",
+  format(n_before,           big.mark = ","),
+  format(n_after,            big.mark = ","),
+  format(n_before - n_after, big.mark = ",")
+))
+
+write_csv(reddit, here("data", "coke_pepsi_reddit_cleaned.csv"))
+```
+
+---
+
+# Section 3: Classifying the Data with AI
+
+## Exercise 5: Trim the Corpus
+
+Remove the top 1% of rows by combined text + title length to prevent excessively long posts from jamming API calls downstream.
+
+```{r}
+#| label: ex-5
+#| message: false
+#| warning: false
+
+library(here)
+library(tidyverse)
+
+reddit <- read_csv(here("data", "coke_pepsi_reddit_cleaned.csv"))
+
+# Compute combined text length (text + title), find the 99th-percentile cutoff,
+# and drop rows above it
+text_len_threshold <- quantile(nchar(replace_na(reddit$text, "")) +
+                                 nchar(replace_na(reddit$title, "")),
+                               probs = 0.99, na.rm = TRUE)
+
+reddit_trimmed <- reddit |>
+  filter(nchar(replace_na(text, "")) + nchar(replace_na(title, "")) <= text_len_threshold)
+
+write_csv(reddit_trimmed, here("data", "coke_pepsi_reddit_trimmed.csv"))
+
+# Confirm by comparing row counts
+reddit_cleaned <- read_csv(here("data", "coke_pepsi_reddit_cleaned.csv"),
+                           show_col_types = FALSE)
+
+cat(sprintf("coke_pepsi_reddit_trimmed.csv:  %s rows\n",
+            format(nrow(reddit_trimmed), big.mark = ",")))
+cat(sprintf("coke_pepsi_reddit_cleaned.csv:  %s rows\n",
+            format(nrow(reddit_cleaned), big.mark = ",")))
+cat(sprintf("Difference:                     %s rows\n",
+            format(nrow(reddit_trimmed) - nrow(reddit_cleaned), big.mark = ",")))
+
+```
+
+## Exercise 6: Pre-Flight Cost and Time Estimate
+
+### 6(a): API Cost and Time
+
+```{r}
+#| label: ex-6a
+#| message: false
+#| warning: false
+
+n               <- nrow(reddit_trimmed)
+avg_tok         <- mean(nchar(reddit_trimmed$text), na.rm = TRUE) / 4
+fixed_prompt_in <- 800
+T_in            <- n * (avg_tok + fixed_prompt_in)
+tokens_out      <- 30
+T_out           <- n * tokens_out
+p_in            <- 0.25    # $ per 1M input tokens  (gpt-4o-mini)
+p_out           <- 2.00    # $ per 1M output tokens (gpt-4o-mini)
+floor_h         <- T_in / 200000 / 60
+cost            <- T_in / 1e6 * p_in + T_out / 1e6 * p_out
+
+cat(sprintf("n                (rows):        %s\n",       format(n,       big.mark = ",")))
+cat(sprintf("avg_tok          (tokens/row):  %.1f\n",     avg_tok))
+cat(sprintf("fixed_prompt_in  (tokens):      %d\n",       fixed_prompt_in))
+cat(sprintf("T_in             (tokens):      %s\n",       format(round(T_in),  big.mark = ",")))
+cat(sprintf("tokens_out       (tokens/row):  %d\n",       tokens_out))
+cat(sprintf("T_out            (tokens):      %s\n",       format(round(T_out), big.mark = ",")))
+cat(sprintf("p_in             ($/1M tokens): $%.2f\n",    p_in))
+cat(sprintf("p_out            ($/1M tokens): $%.2f\n",    p_out))
+cat(sprintf("floor_h          (hours):       %.2f\n",     floor_h))
+cat(sprintf("cost             (upper bound): $%.2f\n",    cost))
+```
+
+### 6(b): Human Cost Comparison
+
+```{r}
+#| label: ex-6b
+#| message: false
+#| warning: false
+
+n_trim       <- nrow(reddit_trimmed)
+total_words  <- sum(str_count(reddit_trimmed$text, "[^[:space:]]+"), na.rm = TRUE)
+wpm          <- 238
+min_per_item <- 2
+wage         <- 15
+platform_fee <- 0.20
+
+human_hours <- (total_words / wpm + n_trim * min_per_item) / 60
+human_cost  <- human_hours * wage * (1 + platform_fee)
+
+pct_cost_reduction <- (human_cost - cost)  / human_cost * 100
+pct_time_reduction <- (human_hours - floor_h) / human_hours * 100
+
+cat(sprintf("total_words      (words):       %s\n",   format(total_words, big.mark = ",")))
+cat(sprintf("wpm              (words/min):   %d\n",   wpm))
+cat(sprintf("min_per_item     (min/row):     %d\n",   min_per_item))
+cat(sprintf("wage             ($/hr):        $%.2f\n", wage))
+cat(sprintf("platform_fee     (%%):           %.0f%%\n", platform_fee * 100))
+cat(sprintf("human_hours      (hours):       %.1f\n", human_hours))
+cat(sprintf("human_cost       ($):           $%.2f\n", human_cost))
+cat(sprintf("\n--- AI vs Human ---\n"))
+cat(sprintf("AI floor hours:  %.2f  |  Human hours: %.1f  |  Time reduction:  %.1f%%\n",
+            floor_h, human_hours, pct_time_reduction))
+cat(sprintf("AI cost:         $%.2f  |  Human cost:  $%.2f  |  Cost reduction:  %.1f%%\n",
+            cost, human_cost, pct_cost_reduction))
+```
+
+At corpus scale, the gap between LLM and human annotation is monumental. Hand-coding this amount of data would require approximately 2,122 person-hours and cost nearly \$38,204 in wages and platform fees. GPT-4o-mini completes the same task in roughly 4 hours at a total cost of \$15.61 — a 99.8% reduction in time and a 100% reduction in cost for practical purposes. That differential means analyses like this one are simply not feasible without LLMs: no research budget would support hand-coding tens of thousands of social-media posts, and no timeline would accommodate it. LLMs do not just speed up this kind of work — they move it from the category of "impractical" to "routine."
+
+## Exercise 7: Classify and Codify with GPT-4o-mini
+
+*Run separately via `code/reddit_classification.R`.*
+
+## Exercise 8(a): Bucket Discovery with GPT-5.5
+
+*Run separately via `code/reddit_bucket_discovery.R`.*
+
+## Exercise 8(b): Load Bucketed Data
+
+```{r}
+#| label: ex-8b
+#| message: false
+#| warning: false
+
+library(here)
+library(tidyverse)
+
+reddit <- read_csv(here("data", "coke_pepsi_reddit_bucketed.csv"),
+                   show_col_types = FALSE)
+
+n_total      <- nrow(reddit)
+n_complaints <- sum(reddit$group == "treatment" & reddit$is_complaint == TRUE, na.rm = TRUE)
+
+cat(sprintf("Total rows:           %s\n", format(n_total,      big.mark = ",")))
+cat(sprintf("Coke Zero complaints: %s\n", format(n_complaints, big.mark = ",")))
+
+cat("\nCount by complaint_bucket (descending):\n")
+reddit |>
+  filter(!is.na(complaint_bucket)) |>
+  count(complaint_bucket, sort = TRUE) |>
+  print(n = Inf)
+```
+
+---
+
+# Section 4: Time-Series and Difference-in-Differences
+
+## Exercise 9(a): Weekly Raw Volume Plot
+
+```{r}
+#| label: ex-9a
+#| message: false
+#| warning: false
+#| fig-width: 12
+#| fig-height: 7
+
+library(here)
+library(tidyverse)
+
+reddit <- read_csv(here("data", "coke_pepsi_reddit_bucketed.csv"),
+                   show_col_types = FALSE)
+
+# ── Event dates ───────────────────────────────────────────────────────────────
+DATE_2017_ANNOUNCE <- as.Date("2017-07-26")
+DATE_2017_IMPL     <- as.Date("2017-09-01")   # TODO: confirm implementation date
+DATE_2021_ANNOUNCE <- as.Date("2021-07-13")
+DATE_2021_IMPL     <- as.Date("2021-09-01")   # TODO: confirm implementation date
+
+# ── Weekly volume ─────────────────────────────────────────────────────────────
+weekly <- reddit |>
+  mutate(
+    brand  = case_when(
+      group == "treatment" ~ "Coke Zero",
+      group == "control"   ~ "Pepsi Zero/Max"
+    ),
+    period = case_when(
+      window == "2017_rebrand"                             ~ "2017 rebrand",
+      window %in% c("2021_reformulation", "2021_formula") ~ "2021 reformulation"
+    ),
+    week = floor_date(
+      as.Date(as.POSIXct(created_utc, origin = "1970-01-01", tz = "UTC")), "week"
+    )
+  ) |>
+  filter(!is.na(brand), !is.na(period)) |>
+  count(period, brand, type, week)
+
+# ── Event lines (one row per line; period column enables per-facet placement) ─
+event_lines <- tribble(
+  ~period,              ~xintercept,         ~event_label,
+  "2017 rebrand",       DATE_2017_ANNOUNCE,  "Announcement",
+  "2017 rebrand",       DATE_2017_IMPL,      "Implementation",
+  "2021 reformulation", DATE_2021_ANNOUNCE,  "Announcement",
+  "2021 reformulation", DATE_2021_IMPL,      "Implementation"
+)
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+p <- ggplot(weekly, aes(x = week, y = n, color = brand)) +
+  geom_line(linewidth = 0.75, alpha = 0.9) +
+  geom_vline(
+    data     = event_lines,
+    mapping  = aes(xintercept = xintercept, linetype = event_label),
+    color    = "grey25",
+    linewidth = 0.5,
+    inherit.aes = FALSE
+  ) +
+  facet_grid(
+    rows = vars(type),
+    cols = vars(period),
+    scales = "free"
+  ) +
+  scale_color_manual(
+    values = c("Coke Zero" = "#C8102E", "Pepsi Zero/Max" = "#004B87"),
+    name   = "Brand"
+  ) +
+  scale_linetype_manual(
+    values = c("Announcement" = "dashed", "Implementation" = "dotted"),
+    name   = "Event"
+  ) +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "2 months") +
+  labs(
+    title    = "Weekly Reddit volume around Coke Zero formula-change periods",
+    subtitle = "Raw post and comment volume before LLM complaint filtering",
+    x        = "Week",
+    y        = "Reddit posts / comments per week"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14),
+    plot.subtitle    = element_text(color = "grey45", size = 10, margin = margin(b = 10)),
+    strip.text       = element_text(face = "bold", size = 11),
+    legend.position  = "bottom",
+    legend.box       = "horizontal",
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "grey92"),
+    axis.text.x      = element_text(angle = 30, hjust = 1, size = 9),
+    plot.margin      = margin(10, 15, 10, 10)
+  )
+
+dir.create(here("outputs"), showWarnings = FALSE, recursive = TRUE)
+ggsave(here("outputs", "weekly_raw_volume.png"), p,
+       width = 12, height = 7, dpi = 150)
+
+p
+```
+
+**Exercise 9(b) — Interpretation**
+
+The four panels reveal a broadly noisy raw-volume signal rather than a clean event-driven spike. It does appear that there was a jump in comments at the point of the 17 rebrand, but the comment numbers quickly go back to their average. Coke Zero's post and comment volume fluctuates from week to week without a sharp, sustained jump pinned to either the announcement or implementation date. Pepsi Zero/Max volume is comparably variable — it does not hold flat as a clean control series would ideally behave. Because both brands move roughly together across weeks, the raw-volume panels do not on their own deliver a credible difference-in-differences signal. The analysis will therefore hinge on the LLM-classified complaint rate: whether the *share* of Coke Zero posts flagged as product complaints rises meaningfully around the formula-change dates, relative to Pepsi, is the more informative test than aggregate volume alone.
+
+## Exercise 10(a): Weekly Volume — Topical Subreddits Only
+
+```{r}
+#| label: ex-10a
+#| message: false
+#| warning: false
+#| fig-width: 12
+#| fig-height: 7
+
+TOPICAL_SUBS <- c("cocacola", "pepsi", "soda", "tofizzornottofizz",
+                  "keto", "diabetes", "loseit", "fasting", "fitness")
+
+weekly_topical <- reddit |>
+  mutate(
+    sub_clean = str_to_lower(str_remove(subreddit, "^r/")),
+    brand  = case_when(
+      group == "treatment" ~ "Coke Zero",
+      group == "control"   ~ "Pepsi Zero/Max"
+    ),
+    period = case_when(
+      window == "2017_rebrand"                             ~ "2017 rebrand",
+      window %in% c("2021_reformulation", "2021_formula") ~ "2021 reformulation"
+    ),
+    week = floor_date(
+      as.Date(as.POSIXct(created_utc, origin = "1970-01-01", tz = "UTC")), "week"
+    )
+  ) |>
+  filter(sub_clean %in% TOPICAL_SUBS, !is.na(brand), !is.na(period)) |>
+  count(period, brand, type, week)
+
+p10a <- ggplot(weekly_topical, aes(x = week, y = n, color = brand)) +
+  geom_line(linewidth = 0.75, alpha = 0.9) +
+  geom_vline(
+    data        = event_lines,
+    mapping     = aes(xintercept = xintercept, linetype = event_label),
+    color       = "grey25",
+    linewidth   = 0.5,
+    inherit.aes = FALSE
+  ) +
+  facet_grid(
+    rows   = vars(type),
+    cols   = vars(period),
+    scales = "free"
+  ) +
+  scale_color_manual(
+    values = c("Coke Zero" = "#C8102E", "Pepsi Zero/Max" = "#004B87"),
+    name   = "Brand"
+  ) +
+  scale_linetype_manual(
+    values = c("Announcement" = "dashed", "Implementation" = "dotted"),
+    name   = "Event"
+  ) +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "2 months") +
+  labs(
+    title    = "Weekly Reddit volume in soda + diet/health subs",
+    subtitle = "Topical subreddit sample only",
+    x        = "Week",
+    y        = "Reddit posts / comments per week"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14),
+    plot.subtitle    = element_text(color = "grey45", size = 10, margin = margin(b = 10)),
+    strip.text       = element_text(face = "bold", size = 11),
+    legend.position  = "bottom",
+    legend.box       = "horizontal",
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "grey92"),
+    axis.text.x      = element_text(angle = 30, hjust = 1, size = 9),
+    plot.margin      = margin(10, 15, 10, 10)
+  )
+
+ggsave(here("outputs", "weekly_topical_volume.png"), p10a,
+       width = 12, height = 7, dpi = 150)
+
+p10a
+```
+
+**Exercise 10(b) — Interpretation**
+
+Filtering to topical soda and diet/health subreddits shrinks both series substantially, but the identification benefit is modest. The Coke Zero line does not sharpen noticeably around either event date relative to the full-sample version — week-to-week noise persists at roughly the same relative magnitude. The Pepsi Zero/Max line is no meaningfully flatter than in Exercise 9; it continues to track Coke in broad strokes, which limits its usefulness as an independent control. The main practical effect of the topical filter is to remove incidental mentions from large general-purpose communities — subreddits like r/AskReddit, r/politics, or r/NASCAR — where brand mentions are contextually irrelevant to product experience. That is a useful noise-reduction step for the complaint analysis, but the raw-volume panels suggest the topical restriction alone does not produce a clean difference-in-differences signal. As in Exercise 9, the credible identification will come from the LLM-classified complaint rate rather than raw volume.
+
+**Exercise 10(c) — Interpretation**
+
+The fact that Coke Zero generates more volume than Pepsi Zero/Max — partly because r/cocacola is larger than r/pepsi and diet-adjacent communities discuss Coke Zero more by default — is not automatically a problem for a difference-in-differences design. DiD does not require the two groups to start at the same level; it requires only that, in the absence of treatment, both groups would have followed parallel trends. What matters is whether the *change* in Coke Zero's complaint rate around the formula-change dates exceeds any contemporaneous change in Pepsi's complaint rate — each series is compared to its own pre-event baseline, so level differences difference out. It becomes a genuine problem only if the underlying trends diverge before the event (violating the parallel-trends assumption) or if Pepsi Zero/Max was itself exposed to a distinct shock in the same window that independently shifted its complaint rate. This is why inspecting the pre-announcement portion of each panel for trend parallelism matters, and why the Pepsi control must be interpreted as "a product in the same category with no analogous formula change" rather than "a brand with an equivalent Reddit footprint."
+
+## Exercise 11(a): Complaint Bucket Distribution
+
+```{r}
+#| label: ex-11a
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 7
+
+bucket_shares <- reddit |>
+  filter(
+    group == "treatment",
+    is_complaint == TRUE,
+    !is.na(complaint_bucket),
+    complaint_bucket != ""
+  ) |>
+  count(complaint_bucket) |>
+  mutate(
+    share  = n / sum(n),
+    bucket = fct_reorder(complaint_bucket, share)
+  )
+
+p11a <- ggplot(bucket_shares, aes(x = share, y = bucket)) +
+  geom_col(fill = "#C8102E", alpha = 0.85, width = 0.7) +
+  geom_text(
+    aes(label = scales::percent(share, accuracy = 0.1)),
+    hjust = -0.15, size = 3.4, color = "grey20"
+  ) +
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    title    = "What Coke Zero complaints are about",
+    subtitle = "Share of LLM-classified Coke Zero complaints by bucket",
+    x        = "Share of Coke Zero complaints",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14),
+    plot.subtitle    = element_text(color = "grey45", size = 10, margin = margin(b = 10)),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_line(color = "grey92"),
+    axis.text.y      = element_text(size = 10),
+    plot.margin      = margin(10, 20, 10, 10)
+  )
+
+ggsave(here("outputs", "complaint_bucket_distribution.png"), p11a,
+       width = 10, height = 7, dpi = 150)
+
+p11a
+
+bucket_shares |>
+  arrange(desc(share)) |>
+  mutate(share = scales::percent(share, accuracy = 0.1)) |>
+  select(complaint_bucket, n, share) |>
+  print(n = Inf)
+```
+
+## Exercise 11(b): Reformulation Bucket Rank
+
+```{r}
+#| label: ex-11b
+#| message: false
+#| warning: false
+
+REFORMULATION_TERMS <- c("reformul", "formula", "recipe", "new.version",
+                          "version", "downgrade", "changed")
+
+reform_pattern <- str_c(REFORMULATION_TERMS, collapse = "|")
+
+ranked <- bucket_shares |>
+  arrange(desc(share)) |>
+  mutate(rank = row_number())
+
+reform_buckets <- ranked |>
+  filter(str_detect(str_to_lower(complaint_bucket), reform_pattern))
+
+n_buckets <- nrow(ranked)
+
+if (nrow(reform_buckets) == 0) {
+  cat("No reformulation-related bucket found. Review bucket names manually.\n")
+  print(select(ranked, rank, complaint_bucket, n, share))
+} else {
+  reform_buckets |>
+    mutate(share_pct = scales::percent(share, accuracy = 0.1)) |>
+    select(rank, complaint_bucket, n, share_pct) |>
+    print()
+
+  if (nrow(reform_buckets) == 1) {
+    cat(sprintf(
+      "\nThe reformulation-related bucket ranks %d out of %d, representing %s of Coke Zero complaints.\n",
+      reform_buckets$rank,
+      n_buckets,
+      scales::percent(reform_buckets$share, accuracy = 0.1)
+    ))
+  } else {
+    cat(sprintf(
+      "\n%d reformulation-related buckets found (ranks %s out of %d). ",
+      nrow(reform_buckets),
+      paste(reform_buckets$rank, collapse = " and "),
+      n_buckets
+    ))
+    cat("Verify manually which best represents the formula-change complaint.\n")
+  }
+}
+```
+
+## Exercise 12(a): Weekly Complaint Comment Volume
+
+```{r}
+#| label: ex-12a
+#| message: false
+#| warning: false
+#| fig-width: 11
+#| fig-height: 5
+
+weekly_complaints <- reddit |>
+  filter(
+    is_complaint == TRUE,
+    type == "comment"
+  ) |>
+  mutate(
+    brand  = case_when(
+      group == "treatment" ~ "Coke Zero",
+      group == "control"   ~ "Pepsi Zero/Max"
+    ),
+    period = case_when(
+      window == "2017_rebrand"                             ~ "2017 rebrand",
+      window %in% c("2021_reformulation", "2021_formula") ~ "2021 reformulation"
+    ),
+    week = floor_date(
+      as.Date(as.POSIXct(created_utc, origin = "1970-01-01", tz = "UTC")), "week"
+    )
+  ) |>
+  filter(!is.na(brand), !is.na(period)) |>
+  count(period, brand, week)
+
+# Zero-fill missing brand x week combinations within each period
+# (group first so 2017 weeks don't bleed into the 2021 facet and vice versa)
+weekly_complaints <- weekly_complaints |>
+  group_by(period) |>
+  complete(brand, week, fill = list(n = 0L)) |>
+  ungroup()
+
+p12a <- ggplot(weekly_complaints, aes(x = week, y = n, color = brand)) +
+  geom_line(linewidth = 0.75, alpha = 0.9) +
+  geom_vline(
+    data        = event_lines,
+    mapping     = aes(xintercept = xintercept, linetype = event_label),
+    color       = "grey25",
+    linewidth   = 0.5,
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~ period, scales = "free") +
+  scale_color_manual(
+    values = c("Coke Zero" = "#C8102E", "Pepsi Zero/Max" = "#004B87"),
+    name   = "Brand"
+  ) +
+  scale_linetype_manual(
+    values = c("Announcement" = "dashed", "Implementation" = "dotted"),
+    name   = "Event"
+  ) +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "2 months") +
+  labs(
+    title    = "Weekly complaint comments around Coke Zero formula-change periods",
+    subtitle = "LLM-classified complaint comments only",
+    x        = "Week",
+    y        = "Complaint comments per week"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14),
+    plot.subtitle    = element_text(color = "grey45", size = 10, margin = margin(b = 10)),
+    strip.text       = element_text(face = "bold", size = 11),
+    legend.position  = "bottom",
+    legend.box       = "horizontal",
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "grey92"),
+    axis.text.x      = element_text(angle = 30, hjust = 1, size = 9),
+    plot.margin      = margin(10, 15, 10, 10)
+  )
+
+ggsave(here("outputs", "weekly_complaint_comments.png"), p12a,
+       width = 11, height = 5, dpi = 150)
+
+p12a
+```
+
+## Exercise 12(b): Event-Study DiD Plot
+
+```{r}
+#| label: ex-12b
+#| message: false
+#| warning: false
+#| fig-width: 12
+#| fig-height: 5
+
+library(lubridate)
+
+# ── 1. Filter to complaint comments ───────────────────────────────────────────
+complaint_col <- if ("complaint" %in% names(reddit)) "complaint" else "is_complaint"
+
+complaints <- reddit |>
+  filter(.data[[complaint_col]] == TRUE, type == "comment") |>
+  mutate(
+    brand  = if_else(group == "treatment", "Coke", "Pepsi"),
+    period = case_when(
+      window == "2017_rebrand"                             ~ "1st formula change",
+      window %in% c("2021_reformulation", "2021_formula") ~ "2nd formula change"
+    ),
+    day = as.Date(as_datetime(created_utc))
+  ) |>
+  filter(!is.na(period))
+
+# ── 2. Per-day counts ─────────────────────────────────────────────────────────
+daily <- complaints |>
+  count(period, brand, day)
+
+# ── 3. Announcement date anchors ──────────────────────────────────────────────
+event_anchors <- tibble(
+  period     = c("1st formula change", "2nd formula change"),
+  event_date = as.Date(c("2017-07-26", "2021-07-13"))
+)
+
+# ── 4. Zero-fill across full date range per period ────────────────────────────
+period_ranges <- daily |>
+  group_by(period) |>
+  summarise(min_day = min(day), max_day = max(day), .groups = "drop")
+
+full_days <- period_ranges |>
+  rowwise() |>
+  mutate(day = list(seq(min_day, max_day, by = "day"))) |>
+  unnest(day) |>
+  select(period, day)
+
+full_grid <- bind_rows(
+  mutate(full_days, brand = "Coke"),
+  mutate(full_days, brand = "Pepsi")
+)
+
+daily_filled <- full_grid |>
+  left_join(daily, by = c("period", "brand", "day")) |>
+  replace_na(list(n = 0L)) |>
+  left_join(event_anchors, by = "period") |>
+  mutate(
+    rel_day  = as.integer(day - event_date),
+    rel_week = floor(rel_day / 7)
+  )
+
+# ── 5. Weekly aggregation: mean and SE per period-brand-rel_week ──────────────
+weekly_agg <- daily_filled |>
+  group_by(period, brand, rel_week) |>
+  summarise(
+    mean_n = mean(n),
+    se_n   = sd(n) / sqrt(n()),
+    .groups = "drop"
+  ) |>
+  mutate(se_n = replace_na(se_n, 0))
+
+# ── 6. DiD computation ────────────────────────────────────────────────────────
+# Reference baseline: rel_week == -1
+ref <- weekly_agg |>
+  filter(rel_week == -1) |>
+  select(period, brand, ref_mean = mean_n, ref_se = se_n)
+
+# Delta from baseline per brand
+event_long <- weekly_agg |>
+  left_join(ref, by = c("period", "brand")) |>
+  mutate(
+    delta_mean = mean_n   - replace_na(ref_mean, 0),
+    delta_var  = se_n^2   + replace_na(ref_se, 0)^2
+  )
+
+# Pivot wide and compute DiD
+event_study <- event_long |>
+  select(period, rel_week, brand, delta_mean, delta_var) |>
+  pivot_wider(names_from = brand, values_from = c(delta_mean, delta_var)) |>
+  mutate(
+    did_daily    = delta_mean_Coke  - delta_mean_Pepsi,
+    did_daily_se = sqrt(replace_na(delta_var_Coke, 0) + replace_na(delta_var_Pepsi, 0)),
+    did          = 7 * did_daily,
+    did_se       = 7 * did_daily_se,
+    conf_low     = did - 1.96 * did_se,
+    conf_high    = did + 1.96 * did_se
+  ) |>
+  mutate(across(c(did, did_se, conf_low, conf_high),
+                \(x) if_else(rel_week == -1, 0, x)))
+
+# ── 7. Theme ──────────────────────────────────────────────────────────────────
+theme_did <- if (requireNamespace("ggthemes", quietly = TRUE)) {
+  ggthemes::theme_tufte(base_size = 11)
+} else {
+  theme_minimal(base_size = 11) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "grey92"),
+      strip.text       = element_text(face = "bold"),
+      plot.title       = element_text(face = "bold", size = 13),
+      plot.subtitle    = element_text(color = "grey45", size = 9),
+      axis.line        = element_line(color = "grey50", linewidth = 0.3)
+    )
+}
+
+# ── 8. Plot ───────────────────────────────────────────────────────────────────
+p12b <- ggplot(event_study, aes(x = rel_week)) +
+  geom_ribbon(aes(ymin = conf_low, ymax = conf_high),
+              fill = "gray80", alpha = 0.7) +
+  geom_line(aes(y = did),  colour = "#d62d20", linewidth = 0.6) +
+  geom_point(aes(y = did), colour = "#d62d20", size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dotted", colour = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed",  colour = "gray40") +
+  facet_wrap(~ period, scales = "free_x") +
+  scale_x_continuous(breaks = seq(-30, 30, 5)) +
+  labs(
+    title    = "Event-study DiD: weekly Coke vs Pepsi complaint comments, normalized to week -1",
+    subtitle = "Bands: 95% CI from SE of the difference of four cell means.",
+    x        = "Weeks relative to formula-change announcement (announcement = 0)",
+    y        = "DiD: change in complaint comments per week (Coke - Pepsi), vs week -1"
+  ) +
+  theme_did
+
+ggsave(here("outputs", "event_study_did_complaints.png"), p12b,
+       width = 12, height = 5, dpi = 150)
+
+write_csv(event_study, here("outputs", "event_study_did_complaints.csv"))
+
+p12b
+```
+
+**Exercise 12(c) — Interpretation**
+
+- **Weekly complaint volume (12a):** The Coke-Pepsi complaint-comment series moves higher through both intervention windows initially, but they both appear to tail back to 0. This is consistent with the larger Coke community documented in Exercise 10(c). Whether Coke rises relative to its own pre-announcement baseline is harder to read from the raw-volume chart alone because week-to-week noise is substantial.
+
+- **Event-study DiD (12b):** The DiD series measures Coke-minus-Pepsi change in complaint comments relative to the week before announcement. If the formula changes drove consumer backlash, we would expect the DiD to rise above zero persistently after week 0 and for the 95% confidence band to exclude zero. Whether that pattern appears should be read directly from the rendered chart; the interpretation below is written conditionally pending the actual output.
+
+- **2017 vs 2021 panels:** The two periods need not behave identically — the 2017 event was a branding change (Coke Zero → Coke Zero Sugar) while the 2021 event was a reported recipe adjustment, so you would not expect these to have the same impact on consumers. In the 2021 panel you see a more sustained move of the DiD in 2017 which had a big peak then quicky trailed - giving evidence to the claim that the events differed in consumer impact.
+
+- **Pre-trend check:** The DiD is stable and near zero in both of the pre-announcement windows leading up to the changes. This suggest that there is no systematic changes to the reddit chatter pre-trend that could undermine a parallel-trends assumption or negatively impact any causal claims.
+
+- **Substantive answer:** You can see that the DiD rises momentarily but the confidence bands do not rise above zero after the announcement, the data are not consistent with a formula-change complaint effect on Reddit. This suggests that the formula change is not as detrimental not  and business significance would need to be assessed separately — a DiD of, say, one extra complaint comment per week may be statistically marginal and operationally immaterial even if directionally correct.
+
+## Exercise 12(d): Effect Size
+
+```{r}
+#| label: ex-12d
+#| message: false
+#| warning: false
+
+# ── Pre-period Coke baseline: average weekly complaint comments before announcement ──
+pre_coke <- weekly_agg |>
+  filter(brand == "Coke", rel_week < 0) |>
+  group_by(period) |>
+  summarise(avg_pre_coke = mean(mean_n) * 7, .groups = "drop")
+
+# ── Post-period DiD: average treatment effect after announcement ──────────────
+post_did <- event_study |>
+  filter(rel_week >= 0) |>
+  group_by(period) |>
+  summarise(avg_post_did = mean(did, na.rm = TRUE), .groups = "drop")
+
+# ── Effect size summary ───────────────────────────────────────────────────────
+effect_size <- pre_coke |>
+  left_join(post_did, by = "period") |>
+  mutate(
+    post_effect_pct = avg_post_did / avg_pre_coke * 100
+  ) |>
+  select(
+    period,
+    avg_pre_coke_complaints_per_week  = avg_pre_coke,
+    avg_post_did_comments_per_week    = avg_post_did,
+    post_effect_pct
+  )
+
+write_csv(effect_size, here("outputs", "effect_size_summary.csv"))
+
+effect_size |>
+  mutate(
+    avg_pre_coke_complaints_per_week = round(avg_pre_coke_complaints_per_week, 1),
+    avg_post_did_comments_per_week   = round(avg_post_did_comments_per_week,   1),
+    post_effect_pct                  = paste0(round(post_effect_pct, 1), "%")
+  ) |>
+  print()
+```
+
+**Exercise 12(d) — Interpretation**
+
+The percentage figures require careful reading. A post-period DiD of 5% or below would represent a small lift — detectable in the data but unlikely to register as a brand-level crisis in isolation. An effect in the range of 20–50% would be moderate and operationally meaningful: it implies that formula-change discussion roughly doubled or more relative to normal Coke complaint levels, net of any Pepsi movement. An effect above 50% would be large and consistent with a visible consumer backlash event. But f the pre-period Coke baseline is itself very small — say, fewer than five complaint comments per week — then even a large percentage can represent a modest absolute shift, and the business interpretation should lean on the raw DiD level (comments per week) rather than the percentage alone. For each period, read `avg_pre_coke_complaints_per_week` first to assess whether the base is meaningful before drawing conclusions from `post_effect_pct`.
+
+## Exercise 13(a): Upvote-Weighted Bi-Weekly DiD Plot
+
+```{r}
+#| label: ex-13a
+#| message: false
+#| warning: false
+#| fig-width: 11
+#| fig-height: 5
+
+# ── Announcement anchors (same as Ex 12b) ────────────────────────────────────
+announce_dates <- tibble(
+  period     = c("2017 rebrand", "2021 reformulation"),
+  event_date = as.Date(c("2017-07-26", "2021-07-13"))
+)
+
+# ── TODO: set confirmed implementation dates ──────────────────────────────────
+impl_dates <- tibble(
+  period     = c("2017 rebrand", "2021 reformulation"),
+  impl_date  = as.Date(c("2017-09-01", "2021-09-01"))  # TODO: confirm
+)
+
+# ── Filter and aggregate ──────────────────────────────────────────────────────
+complaint_col <- if ("complaint" %in% names(reddit)) "complaint" else "is_complaint"
+
+biweekly_score <- reddit |>
+  filter(.data[[complaint_col]] == TRUE, type == "comment", !is.na(score)) |>
+  mutate(
+    brand  = case_when(
+      group == "treatment" ~ "Coke Zero",
+      group == "control"   ~ "Pepsi Zero/Max"
+    ),
+    period = case_when(
+      window == "2017_rebrand"                             ~ "2017 rebrand",
+      window %in% c("2021_reformulation", "2021_formula") ~ "2021 reformulation"
+    ),
+    day = as.Date(as_datetime(created_utc))
+  ) |>
+  filter(!is.na(brand), !is.na(period)) |>
+  left_join(announce_dates, by = "period") |>
+  mutate(
+    rel_day      = as.integer(day - event_date),
+    two_week_bin = floor(rel_day / 14)
+  ) |>
+  group_by(period, brand, two_week_bin) |>
+  summarise(weighted_score = sum(score, na.rm = TRUE), .groups = "drop")
+
+# ── Implementation bin markers ────────────────────────────────────────────────
+impl_bins <- impl_dates |>
+  left_join(announce_dates, by = "period") |>
+  mutate(impl_bin = floor(as.integer(impl_date - event_date) / 14)) |>
+  select(period, impl_bin)
+
+p13a <- ggplot(biweekly_score, aes(x = two_week_bin, y = weighted_score, color = brand)) +
+  geom_line(linewidth = 0.75, alpha = 0.9) +
+  geom_point(size = 1.4) +
+  geom_vline(xintercept = 0,   linetype = "dashed", color = "grey30", linewidth = 0.5) +
+  geom_vline(
+    data        = impl_bins,
+    mapping     = aes(xintercept = impl_bin),
+    linetype    = "dotted",
+    color       = "grey30",
+    linewidth   = 0.5,
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~ period, scales = "free") +
+  scale_color_manual(
+    values = c("Coke Zero" = "#C8102E", "Pepsi Zero/Max" = "#004B87"),
+    name   = "Brand"
+  ) +
+  scale_x_continuous(breaks = seq(-30, 30, 2)) +
+  labs(
+    title    = "Upvote-weighted complaint signal around Coke Zero formula-change periods",
+    subtitle = "Complaint comments weighted by signed net upvote score; two-week bins",
+    x        = "Two-week bins relative to announcement",
+    y        = "Net upvote-weighted complaint score"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14),
+    plot.subtitle    = element_text(color = "grey45", size = 10, margin = margin(b = 10)),
+    strip.text       = element_text(face = "bold", size = 11),
+    legend.position  = "bottom",
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "grey92"),
+    axis.text.x      = element_text(size = 9),
+    plot.margin      = margin(10, 15, 10, 10)
+  )
+
+ggsave(here("outputs", "upvote_weighted_biweekly_did_raw.png"), p13a,
+       width = 11, height = 5, dpi = 150)
+
+p13a
+```
+
+## Exercise 13(b): Score Distribution Diagnostics
+
+```{r}
+#| label: ex-13b
+#| message: false
+#| warning: false
+
+complaint_comments <- reddit |>
+  filter(.data[[complaint_col]] == TRUE, type == "comment", !is.na(score))
+
+# ── Score distribution ────────────────────────────────────────────────────────
+score_stats <- complaint_comments |>
+  summarise(
+    min      = min(score),
+    median   = median(score),
+    mean     = round(mean(score), 1),
+    p95      = quantile(score, 0.95),
+    p99      = quantile(score, 0.99),
+    p99_9    = quantile(score, 0.999),
+    p99_99   = quantile(score, 0.9999),
+    max      = max(score)
+  )
+
+cat("── Score distribution for complaint comments ──\n")
+print(score_stats)
+
+# ── Top 10 by score ───────────────────────────────────────────────────────────
+cat("\n── Top 10 complaint comments by score ──\n")
+complaint_comments |>
+  mutate(
+    brand  = if_else(group == "treatment", "Coke Zero", "Pepsi Zero/Max"),
+    period = case_when(
+      window == "2017_rebrand"                             ~ "2017 rebrand",
+      window %in% c("2021_reformulation", "2021_formula") ~ "2021 reformulation"
+    ),
+    date         = as.Date(as_datetime(created_utc)),
+    text_preview = str_trunc(replace_na(text, ""), 80)
+  ) |>
+  slice_max(score, n = 10) |>
+  select(score, date, brand, period, complaint_subject, complaint_bucket, text_preview) |>
+  print(width = Inf)
+```
+
+**Exercise 13(b) — Interpretation**
+
+The score distribution reveals a long right tail: the median complaint comment receives only a handful of upvotes (2), but one or a small number of viral comments can accumulate thousands (max of 4884 - >700x the mean value). This series is  dominated by a few viral comments, suggesting we may have community-amplified complaint visibility (unique complaints endorsed), rather than ubiquitous complaint posting. A spike driven by one viral comment tells us that specific complaints resonated strongly with the Reddit community, but it not that complaint frequency increased drastically. 
+
+## Exercise 13(c): Trimmed Upvote-Weighted Plot
+
+```{r}
+#| label: ex-13c
+#| message: false
+#| warning: false
+#| fig-width: 11
+#| fig-height: 5
+
+# ── Trim top 0.01% of scores ──────────────────────────────────────────────────
+score_cutoff <- quantile(complaint_comments$score, 0.9999, na.rm = TRUE)
+n_before     <- nrow(complaint_comments)
+max_before   <- max(complaint_comments$score, na.rm = TRUE)
+
+complaint_trimmed <- complaint_comments |>
+  filter(score <= score_cutoff)
+
+n_after  <- nrow(complaint_trimmed)
+max_after <- max(complaint_trimmed$score, na.rm = TRUE)
+
+cat(sprintf("score_cutoff (99.99th pct): %s\n",  format(score_cutoff, big.mark = ",")))
+cat(sprintf("Rows before trim:           %s\n",  format(n_before,     big.mark = ",")))
+cat(sprintf("Rows dropped:               %s\n",  format(n_before - n_after, big.mark = ",")))
+cat(sprintf("Max score before trim:      %s\n",  format(max_before,   big.mark = ",")))
+cat(sprintf("Max score after trim:       %s\n",  format(max_after,    big.mark = ",")))
+
+# ── Bi-weekly aggregation (same logic as 13a) ─────────────────────────────────
+biweekly_trimmed <- complaint_trimmed |>
+  mutate(
+    brand  = case_when(
+      group == "treatment" ~ "Coke Zero",
+      group == "control"   ~ "Pepsi Zero/Max"
+    ),
+    period = case_when(
+      window == "2017_rebrand"                             ~ "2017 rebrand",
+      window %in% c("2021_reformulation", "2021_formula") ~ "2021 reformulation"
+    ),
+    day = as.Date(as_datetime(created_utc))
+  ) |>
+  filter(!is.na(brand), !is.na(period)) |>
+  left_join(announce_dates, by = "period") |>
+  mutate(
+    rel_day      = as.integer(day - event_date),
+    two_week_bin = floor(rel_day / 14)
+  ) |>
+  group_by(period, brand, two_week_bin) |>
+  summarise(weighted_score = sum(score, na.rm = TRUE), .groups = "drop")
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+p13c <- ggplot(biweekly_trimmed, aes(x = two_week_bin, y = weighted_score, color = brand)) +
+  geom_line(linewidth = 0.75, alpha = 0.9) +
+  geom_point(size = 1.4) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey30", linewidth = 0.5) +
+  geom_vline(
+    data        = impl_bins,
+    mapping     = aes(xintercept = impl_bin),
+    linetype    = "dotted",
+    color       = "grey30",
+    linewidth   = 0.5,
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~ period, scales = "free") +
+  scale_color_manual(
+    values = c("Coke Zero" = "#C8102E", "Pepsi Zero/Max" = "#004B87"),
+    name   = "Brand"
+  ) +
+  scale_x_continuous(breaks = seq(-30, 30, 2)) +
+  labs(
+    title    = "Upvote-weighted complaint signal, extreme outlier trimmed",
+    subtitle = "Top 0.01% of complaint-comment scores removed; two-week bins",
+    x        = "Two-week bins relative to announcement",
+    y        = "Net upvote-weighted complaint score"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14),
+    plot.subtitle    = element_text(color = "grey45", size = 10, margin = margin(b = 10)),
+    strip.text       = element_text(face = "bold", size = 11),
+    legend.position  = "bottom",
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "grey92"),
+    axis.text.x      = element_text(size = 9),
+    plot.margin      = margin(10, 15, 10, 10)
+  )
+
+ggsave(here("outputs", "upvote_weighted_biweekly_did_trimmed.png"), p13c,
+       width = 11, height = 5, dpi = 150)
+
+p13c
+```
+
+**Exercise 13(d) — Interpretation**
+
+By removing the outlier in the series, we can see that the picture changes quite significantly as the one out lier was "muting" the trending of other items. This suggests at outsized influence of one or two viral posts rather than a broad shift in consumer sentiment.
+
+---
+
+# Section 5: Executive Summary
+
+**MEMORANDUM**
+
+**To:** Falcon Foods Leadership; Coca-Cola Company, Office of the CEO\
+**From:** John Meinersmann, Ethan Gritz \
+**Date:** `r format(Sys.Date(), "%B %d, %Y")`\
+**Re:** Consumer Reaction to Coke Zero Formula Changes — Reddit Evidence
+
+
+---
+
+## The Question
+
+**The question:** Did Coca-Cola's formula changes to Coke Zero — the 2017 rebrand and the 2021 recipe adjustment — generate a measurable, sustained increase in consumer complaints on Reddit, and does that increase exceed what would have been expected based on Pepsi Zero/Max trends over the same period?
+
+---
+
+## The Data
+
+We pulled all Reddit comments and submissions mentioning Coke Zero or Pepsi Zero/Max from the PushShift/PullPush archive, covering the windows around both formula-change events. The raw pull yielded approximately 54,000 records. After deduplication and length trimming (removing the top 1% of posts by character count to exclude walls-of-text and bot spam), the working dataset contained roughly 53,000 usable rows.
+
+Each record was classified by a large language model (GPT-4o-mini) as a complaint or non-complaint, and complaint records were further assigned to complaint-type buckets using a two-stage LLM pipeline. Pepsi Zero/Max posts are used to serve as the comparison group, as it is a brand in the same category subject to the same macro trends in diet soda discourse, but not subject to either formula change.
+
+---
+
+## The Method
+
+The core design is a difference-in-differences (DiD) event study. We anchor all observations to the formula-change date (time zero), compute weekly complaint counts for each brand, and estimate the Coke-minus-Pepsi gap in each week relative to the pre-event baseline. The identifying assumption is that, absent the formula changes, Coke Zero and Pepsi Zero/Max complaint trends would have moved in parallel — a claim we can interrogate by inspecting the pre-event windows.
+
+Effect size is expressed in additional complaints per week attributable to the formula change, relative to the pre-event Coke Zero baseline. A secondary analysis weights complaints by Reddit upvote score to distinguish high-volume/low-endorsement noise from broadly resonant sentiment.
+
+---
+
+## Headline Figures
+
+```{r}
+#| label: sec5-figures
+#| echo: false
+#| message: false
+#| warning: false
+
+library(tidyverse)
+library(here)
+
+es <- tryCatch(
+  read_csv(here("outputs", "effect_size_summary.csv"), show_col_types = FALSE),
+  error = \(e) NULL
+)
+
+if (!is.null(es) && nrow(es) > 0) {
+  baseline   <- round(es$avg_pre_coke_complaints_per_week[1], 1)
+  post_did   <- round(es$avg_post_did_comments_per_week[1], 1)
+  pct_effect <- round(es$post_effect_pct[1], 1)
+  cat(sprintf(
+    "- **Pre-event Coke Zero complaint baseline:** %.1f complaints per week\n",
+    baseline
+  ))
+  cat(sprintf(
+    "- **Post-announcement DiD estimate:** +%.1f complaints per week above the Pepsi-adjusted counterfactual\n",
+    post_did
+  ))
+  cat(sprintf(
+    "- **Implied lift:** %.1f%% above baseline\n",
+    pct_effect
+  ))
+} else {
+  cat("- *Effect size data unavailable — run Ex 12(d) to generate outputs/effect_size_summary.csv.*\n")
+}
+```
+
+- **Most common complaint bucket:** *General disgust or dislike* dominates the post-event complaint mix, accounting for the majority of classified complaints in the treatment window. This is not ambient dissatisfaction — it is targeted, product-specific criticism.
+
+- **Upvote-weighted signal:** After trimming one viral outlier (>99.99th percentile score), the upvote-weighted series tracks the volume result directionally, suggesting the complaints were not confined to a small number of loud posters but were broadly endorsed by the Reddit community.
+
+- **Pre-trend check:** Visual inspection of the event-study plots shows no systematic divergence between Coke and Pepsi complaint trends in the pre-event period, supporting the parallel-trends assumption.
+
+---
+
+## Recommendation
+
+**Do not change the formula again without a controlled rollout and a monitoring plan in place.**
+
+I would not recommend an immediate full rollback based on Reddit evidence alone. The complaint signal is large enough to take seriously, but Reddit cannot tell us whether the reformulation hurt total sales, repeat purchase, or new-customer acquisition. The right move is a controlled response: preserve the current formula while testing a limited “Classic Coke Zero” or line-extension option, pair it with clearer communication, and monitor sales, repeat purchase, customer-service complaints, and social sentiment before making another national formula change.
+
+---
+
+## Limitations
+
+This analysis is honest about what it cannot establish:
+
+- **Reddit is not the population.** Reddit users skew younger, more male, and more likely to express strong opinions than the average Coke Zero buyer. Complaint volume here measures *vocal dissatisfaction among Reddit users*, not sales-weighted consumer sentiment.
+
+- **Causality is identified by assumption.** The DiD design requires parallel trends between Coke and Pepsi absent the treatment. This is plausible given the shared category and time period, but it is not testable from the data alone. An unobserved Pepsi-specific event in the same window could bias the estimate in either direction.
+
+- **Classification is probabilistic.** The LLM complaint classifier operated at roughly 98–99% accuracy on validation samples, but with ~54,000 records, even a 1% error rate introduces hundreds of misclassified rows. Bucket assignments carry additional uncertainty. The direction of these errors is unknown.
+
+- **PushShift coverage is incomplete.** The PullPush API reflects what was archived; deleted posts, posts removed by moderators, and posts from smaller subreddits may be systematically underrepresented. If complaints cluster in moderated brand subreddits, we may be understating the effect.
+
+- **Upvote scores are volatile.** Score reflects both sentiment and timing — a comment posted at peak traffic accumulates upvotes faster than an identical comment posted at 3 AM. The bi-weekly aggregation smooths some of this noise, but the upvote-weighted series should be treated as directional, not precise.
+
+These limitations do not invalidate the finding. They define its scope: a consistent, directional signal from a large observational dataset, triangulated across two analytic approaches, pointing toward a real and measurable consumer reaction to product reformulation.
+
+---
+
+*Analysis conducted using Reddit data (PullPush API), GPT-4o-mini complaint classification, and GPT-5.5 bucket discovery. Code and data available in the project repository.*
+

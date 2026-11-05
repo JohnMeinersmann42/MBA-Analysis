@@ -1,0 +1,32 @@
+# Local credentials and assistant settings
+.env
+.env.*
+!.env.example
+.Renviron
+.claude/
+
+# Runtime state and caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+.quarto/
+
+# Downloaded datasets, checkpoints, and generated analysis artifacts
+data/
+checkpoints/
+results/
+outputs/
+plots/
+images/
+writeup/*.docx
+*_files/
+*_cache/
+*.pdf
+*.docx
+*.zip
+*.rds
